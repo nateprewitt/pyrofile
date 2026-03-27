@@ -23,7 +23,12 @@ url = { version = "2", optional = true }
 
 [features]
 default = []
-azure = ["dep:tokio", "dep:azure_storage_blob", "dep:azure_identity", "dep:azure_core", "dep:uuid", "dep:base64", "dep:url"]
+azure = ["dep:tokio", "dep:azure_storage_blob", "dep:azure_identity", "dep:azure_core", "dep:uuid", "dep:base64", "dep:url", "dep:openssl-sys"]
+
+[dependencies.openssl-sys]
+version = "0.9"
+features = ["vendored"]
+optional = true
 
 [dev-dependencies]
 tempfile = "3"

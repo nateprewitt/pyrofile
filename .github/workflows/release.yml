@@ -23,8 +23,18 @@ jobs:
         with:
           target: ${{ matrix.target }}
           command: build
-          args: --release --features azure -o dist
+          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 -o dist
           manylinux: auto
+          before-script-linux: |
+            case "${{ matrix.target }}" in
+              "aarch64")
+                apt-get update
+                apt-get install -y perl make
+                ;;
+              "x86_64")
+                yum install -y perl-core
+                ;;
+            esac
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -43,7 +53,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           command: build
-          args: --release --features azure -o dist
+          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 -o dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-macos-${{ matrix.target }}
