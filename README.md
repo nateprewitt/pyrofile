@@ -20,6 +20,23 @@ with PyroFile("/tmp/model.pt", "w") as f:
 
 with PyroFile("/tmp/model.pt", "r") as f:
     data = f.read()
+
+# Azure Blob Storage
+with PyroFile("az://account/container/model.pt", "w") as f:
+    f.write(data)
+```
+
+Works with `torch.save` and `torch.load`:
+
+```python
+import torch
+from pyrofile import PyroFile
+
+with PyroFile("az://account/container/checkpoint.pt", "w") as f:
+    torch.save(model.state_dict(), f)
+
+with PyroFile("az://account/container/checkpoint.pt", "r") as f:
+    state = torch.load(f, weights_only=True)
 ```
 
 ## Backends
@@ -27,7 +44,7 @@ with PyroFile("/tmp/model.pt", "r") as f:
 | Backend | URI scheme | Status |
 |---------|-----------|--------|
 | Local filesystem | `/path/to/file` | Stable |
-| Azure Blob Storage | `az://account/container/blob` | Planned |
+| Azure Blob Storage | `az://account/container/blob` | Preview |
 | Amazon S3 | `s3://bucket/key` | Planned |
 | Google Cloud Storage | `gs://bucket/object` | Planned |
 
@@ -36,7 +53,8 @@ with PyroFile("/tmp/model.pt", "r") as f:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install maturin pytest
-maturin develop --release
+maturin develop --release --features azure
 cargo test --lib
-pytest tests/python/test_local.py
+python -m pytest tests/python/test_local.py
+python -m pytest tests/python/test_azure_integration.py
 ```
