@@ -1,7 +1,7 @@
 /// Configuration for [`PyroIO`](super::file::PyroIO).
 #[derive(Debug, Clone)]
 pub struct PyroIOConfig {
-    /// Size of the read-ahead buffer in bytes. Default: 1 MB.
+    /// Size of the read-ahead buffer in bytes. Default: 16 MB.
     pub read_buffer_size: usize,
 
     /// Write configuration passed through to SmartWriter.
@@ -23,7 +23,7 @@ pub struct WriteConfig {
 impl Default for PyroIOConfig {
     fn default() -> Self {
         Self {
-            read_buffer_size: 1024 * 1024, // 1 MB
+            read_buffer_size: 16 * 1024 * 1024, // 16 MB
             write_config: WriteConfig::default(),
         }
     }

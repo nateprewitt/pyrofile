@@ -36,6 +36,14 @@ pub trait StorageBackend: Send + Sync {
 
     /// Return a display name for this storage location (path, URI, etc.).
     fn name(&self) -> &str;
+
+    /// Bulk download `length` bytes starting at `offset`.
+    fn download(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; length as usize];
+        let n = self.read_at(offset, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
 }
 
 /// Write interface for storage backends.

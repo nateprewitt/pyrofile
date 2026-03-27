@@ -90,39 +90,16 @@ impl PyroIO {
         Ok(out)
     }
 
-    /// Read all remaining bytes from cursor to EOF, in chunks.
+    /// Read all remaining bytes from cursor to EOF.
     fn read_remaining(&mut self) -> Result<Vec<u8>> {
         let file_size = self.get_size()?;
         if self.cursor >= file_size {
             return Ok(Vec::new());
         }
-        let remaining = (file_size - self.cursor) as usize;
-        let mut out = Vec::with_capacity(remaining.min(8 * 1024 * 1024));
-        let mut chunk = vec![0u8; self.read_buf.capacity()];
-
-        while out.len() < remaining {
-            let to_read = chunk.len().min(remaining - out.len());
-
-            let copied = self.read_buf.read_into(self.cursor, &mut chunk[..to_read]);
-            if copied > 0 {
-                out.extend_from_slice(&chunk[..copied]);
-                self.cursor += copied as u64;
-                continue;
-            }
-
-            let read_offset = self.cursor;
-            self.read_buf
-                .fill_from_backend(read_offset, self.backend.as_ref())?;
-
-            let copied = self.read_buf.read_into(self.cursor, &mut chunk[..to_read]);
-            if copied == 0 {
-                break;
-            }
-            out.extend_from_slice(&chunk[..copied]);
-            self.cursor += copied as u64;
-        }
-
-        Ok(out)
+        let remaining = file_size - self.cursor;
+        let data = self.backend.download(self.cursor, remaining)?;
+        self.cursor += data.len() as u64;
+        Ok(data)
     }
 
     /// Write data. Returns the number of bytes written (always == data.len()).

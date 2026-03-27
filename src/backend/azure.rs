@@ -26,6 +26,9 @@ mod azure_impl {
     impl AzureBackend {
         const BLOCK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
         const MAX_CONCURRENT_UPLOADS: usize = 8;
+        const PARALLEL_READ_THRESHOLD: usize = 16 * 1024 * 1024; // 16 MB
+        const READ_PARTITION_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+        const MAX_CONCURRENT_READS: usize = 8;
 
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
@@ -75,6 +78,100 @@ mod azure_impl {
                 Err(_) => self.runtime.block_on(future),
             }
         }
+
+        /// Single range GET.
+        fn download_range(&self, offset: u64, length: usize) -> Result<Bytes> {
+            let mut options = BlobClientDownloadOptions::default();
+            options.range = Some(format!("bytes={}-{}", offset, offset + length as u64 - 1));
+
+            self.block_on_safe(async {
+                let response = self
+                    .blob_client
+                    .download(Some(options))
+                    .await
+                    .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|e| PyroError::Backend(format!("read body error: {e}")))
+            })
+        }
+
+        /// Parallel chunked download. Returns positioned chunks.
+        fn download_chunked(&self, offset: u64, length: usize) -> Result<Vec<(usize, Bytes)>> {
+            let partition_size = Self::READ_PARTITION_SIZE;
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_READS));
+            let blob_url = self.blob_url.clone();
+
+            let results: Vec<std::result::Result<(usize, Bytes), PyroError>> =
+                self.block_on_safe(async {
+                    let mut handles = Vec::new();
+                    let mut pos = 0usize;
+
+                    while pos < length {
+                        let chunk_len = partition_size.min(length - pos);
+                        let chunk_offset = offset + pos as u64;
+                        let buf_pos = pos;
+                        let url = blob_url.clone();
+                        let sem = Arc::clone(&semaphore);
+
+                        handles.push(tokio::spawn(async move {
+                            let _permit = sem.acquire().await.map_err(|e| {
+                                PyroError::Backend(format!("semaphore error: {e}"))
+                            })?;
+
+                            let client = BlobClient::from_url(
+                                url,
+                                None::<Arc<dyn azure_core::credentials::TokenCredential>>,
+                                None,
+                            )
+                            .map_err(|e| PyroError::Backend(format!("client error: {e}")))?;
+
+                            let mut options = BlobClientDownloadOptions::default();
+                            options.range = Some(format!(
+                                "bytes={}-{}",
+                                chunk_offset,
+                                chunk_offset + chunk_len as u64 - 1
+                            ));
+
+                            let response =
+                                client.download(Some(options)).await.map_err(|e| {
+                                    PyroError::Backend(format!("download error: {e}"))
+                                })?;
+                            let body: Bytes =
+                                response.into_body().collect().await.map_err(|e| {
+                                    PyroError::Backend(format!("read body error: {e}"))
+                                })?;
+
+                            Ok::<(usize, Bytes), PyroError>((buf_pos, body))
+                        }));
+
+                        pos += chunk_len;
+                    }
+
+                    let mut results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        results.push(
+                            handle.await.map_err(|e| {
+                                PyroError::Backend(format!("task join error: {e}"))
+                            })?,
+                        );
+                    }
+                    Ok::<_, PyroError>(results)
+                })?;
+
+            results.into_iter().collect()
+        }
+
+        fn assemble_chunks(chunks: Vec<(usize, Bytes)>, length: usize) -> Vec<u8> {
+            let mut out = vec![0u8; length];
+            for (pos, data) in chunks {
+                let n = data.len().min(length - pos);
+                out[pos..pos + n].copy_from_slice(&data[..n]);
+            }
+            out
+        }
     }
 
     impl StorageBackend for AzureBackend {
@@ -82,23 +179,13 @@ mod azure_impl {
             if buf.is_empty() {
                 return Ok(0);
             }
-            let len = buf.len() as u64;
-            let mut options = BlobClientDownloadOptions::default();
-            options.range = Some(format!("bytes={}-{}", offset, offset + len - 1));
 
-            let data: Bytes = self.block_on_safe(async {
-                let response = self
-                    .blob_client
-                    .download(Some(options))
-                    .await
-                    .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
-                let body = response
-                    .into_body()
-                    .collect()
-                    .await
-                    .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
-                Ok::<_, PyroError>(body)
-            })?;
+            let data = if buf.len() < Self::PARALLEL_READ_THRESHOLD {
+                self.download_range(offset, buf.len())?
+            } else {
+                let chunks = self.download_chunked(offset, buf.len())?;
+                Bytes::from(Self::assemble_chunks(chunks, buf.len()))
+            };
 
             let n = data.len().min(buf.len());
             buf[..n].copy_from_slice(&data[..n]);
@@ -140,6 +227,21 @@ mod azure_impl {
 
         fn name(&self) -> &str {
             &self.blob_url_str
+        }
+
+        fn download(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+            if length == 0 {
+                return Ok(Vec::new());
+            }
+
+            let len = length as usize;
+            if len < Self::PARALLEL_READ_THRESHOLD {
+                let data = self.download_range(offset, len)?;
+                Ok(data.to_vec())
+            } else {
+                let chunks = self.download_chunked(offset, len)?;
+                Ok(Self::assemble_chunks(chunks, len))
+            }
         }
     }
 
