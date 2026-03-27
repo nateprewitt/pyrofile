@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: --release --features azure -o dist
+          manylinux: auto
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist/
+
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: --release --features azure -o dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist/
+
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: --release --features azure -o dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist/
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: sdist
+          args: -o dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdist
+          path: dist/
+
+  publish:
+    needs: [build-linux, build-macos, build-windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
+        with:
+          packages-dir: dist/
