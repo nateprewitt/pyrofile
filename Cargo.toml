@@ -1,0 +1,33 @@
+[package]
+name = "pyrofile"
+version = "0.1.0"
+edition = "2021"
+description = "File-like object for accessing local and cloud storage"
+license = "Apache-2.0"
+authors = ["Nate Prewitt <nate.prewitt@gmail.com>"]
+
+[lib]
+name = "_pyrofile"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+azure_storage_blob = { version = "0.10", optional = true }
+azure_identity = { version = "0.33", optional = true }
+azure_core = { version = "0.33", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+base64 = { version = "0.22", optional = true }
+url = { version = "2", optional = true }
+
+[features]
+default = []
+azure = ["dep:tokio", "dep:azure_storage_blob", "dep:azure_identity", "dep:azure_core", "dep:uuid", "dep:base64", "dep:url"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
