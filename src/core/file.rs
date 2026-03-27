@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::backend::traits::{ObjectWriter, StorageBackend};
-use crate::core::buffer::PrefetchReader;
+use crate::core::buffer::PipelinedReader;
 use crate::core::config::PyroIOConfig;
 use crate::error::{PyroError, Result};
 
@@ -21,7 +21,7 @@ pub struct PyroIO {
     /// Cached file size from metadata; None until first access.
     size: Option<u64>,
     closed: bool,
-    reader: PrefetchReader,
+    reader: PipelinedReader,
     writer: Option<Box<dyn ObjectWriter>>,
 }
 
@@ -32,7 +32,7 @@ impl PyroIO {
         mode: OpenMode,
         config: PyroIOConfig,
     ) -> Self {
-        let reader = PrefetchReader::new(Arc::clone(&backend), config.read_buffer_size);
+        let reader = PipelinedReader::new(Arc::clone(&backend), config.read_buffer_size);
         Self {
             backend,
             mode,
@@ -64,27 +64,8 @@ impl PyroIO {
 
         let size = size as usize;
         let mut out = vec![0u8; size];
-        let mut filled = 0;
-
-        while filled < size {
-            let copied = self.reader.read_into(self.cursor, &mut out[filled..]);
-            if copied > 0 {
-                filled += copied;
-                self.cursor += copied as u64;
-                continue;
-            }
-
-            // Buffer miss - refill from backend.
-            self.reader.fill(self.cursor)?;
-
-            let copied = self.reader.read_into(self.cursor, &mut out[filled..]);
-            if copied == 0 {
-                break;
-            }
-            filled += copied;
-            self.cursor += copied as u64;
-        }
-
+        let filled = self.reader.read_into(self.cursor, &mut out)?;
+        self.cursor += filled as u64;
         out.truncate(filled);
         Ok(out)
     }
@@ -150,8 +131,8 @@ impl PyroIO {
 
         match new_pos {
             Some(p) => {
-                if !self.reader.hit(p) {
-                    self.reader.cancel_prefetch();
+                if p != self.cursor {
+                    self.reader.reset(p);
                 }
                 self.cursor = p;
                 Ok(p)

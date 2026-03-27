@@ -1,128 +1,175 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread;
 
 use crate::backend::traits::StorageBackend;
 use crate::error::{PyroError, Result};
 
-/// A completed prefetch result.
-struct FetchResult {
-    data: Vec<u8>,
+/// A completed prefetch chunk.
+struct Chunk {
     file_offset: u64,
-    valid: usize,
+    data: Vec<u8>,
 }
 
-/// Read-ahead buffer with background prefetching.
+/// Pipelined reader for read-ahead fetches.
 ///
-/// Maintains a current buffer and optionally prefetches the next sequential
-/// chunk in a background thread. The prefetch thread shares the backend via
-/// Arc and communicates results back through a channel.
-pub(crate) struct PrefetchReader {
+pub(crate) struct PipelinedReader {
     backend: Arc<dyn StorageBackend>,
-    buf_size: usize,
+    chunk_size: usize,
+    max_in_flight: usize,
 
-    // Current buffer
-    data: Vec<u8>,
-    file_offset: u64,
-    valid: usize,
+    current: Option<Chunk>,
+    current_pos: usize,
 
-    // Prefetch state
-    pending: Option<std::sync::mpsc::Receiver<Result<FetchResult>>>,
-    pending_offset: u64,
+    ready: VecDeque<Chunk>,
+
+    in_flight: VecDeque<std::sync::mpsc::Receiver<Result<Chunk>>>,
+
+    next_offset: u64,
+
+    eof: bool,
 }
 
-impl PrefetchReader {
-    pub fn new(backend: Arc<dyn StorageBackend>, buf_size: usize) -> Self {
+impl PipelinedReader {
+    const INITIAL_CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
+    const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+    const DEFAULT_MAX_IN_FLIGHT: usize = 8;
+
+    pub fn new(backend: Arc<dyn StorageBackend>, _buf_size: usize) -> Self {
         Self {
             backend,
-            buf_size,
-            data: vec![0u8; buf_size],
-            file_offset: 0,
-            valid: 0,
-            pending: None,
-            pending_offset: 0,
+            chunk_size: Self::INITIAL_CHUNK_SIZE,
+            max_in_flight: Self::DEFAULT_MAX_IN_FLIGHT,
+            current: None,
+            current_pos: 0,
+            ready: VecDeque::new(),
+            in_flight: VecDeque::new(),
+            next_offset: 0,
+            eof: false,
         }
     }
 
-    /// Check if the cursor is within the current buffer.
-    pub fn hit(&self, cursor: u64) -> bool {
-        self.valid > 0
-            && cursor >= self.file_offset
-            && cursor < self.file_offset + self.valid as u64
-    }
-
-    /// Read from the current buffer into `dest`.
-    /// Returns bytes copied. Does not advance any cursor.
-    pub fn read_into(&self, cursor: u64, dest: &mut [u8]) -> usize {
-        if !self.hit(cursor) {
-            return 0;
+    pub fn read_into(&mut self, cursor: u64, dest: &mut [u8]) -> Result<usize> {
+        if dest.is_empty() {
+            return Ok(0);
         }
-        let buf_offset = (cursor - self.file_offset) as usize;
-        let available = self.valid - buf_offset;
-        let n = dest.len().min(available);
-        dest[..n].copy_from_slice(&self.data[buf_offset..buf_offset + n]);
-        n
-    }
 
-    /// Fill the buffer for the given offset. If a matching prefetch is ready,
-    /// use it. Otherwise, do a synchronous read.
-    pub fn fill(&mut self, file_offset: u64) -> Result<()> {
-        // Check if prefetch matches
-        if let Some(rx) = self.pending.take() {
-            if self.pending_offset == file_offset {
-                match rx.recv() {
-                    Ok(Ok(result)) => {
-                        self.data.resize(result.data.len(), 0);
-                        self.data[..result.valid].copy_from_slice(&result.data[..result.valid]);
-                        self.file_offset = result.file_offset;
-                        self.valid = result.valid;
-                        self.start_prefetch(file_offset + self.valid as u64);
-                        return Ok(());
+        // If cursor doesn't match where we are, reset
+        if !self.cursor_matches(cursor) {
+            self.reset(cursor);
+        }
+
+        self.ensure_pipeline_full();
+
+        let mut filled = 0;
+        while filled < dest.len() {
+            if let Some(ref chunk) = self.current {
+                let available = chunk.data.len() - self.current_pos;
+                if available > 0 {
+                    let n = (dest.len() - filled).min(available);
+                    dest[filled..filled + n]
+                        .copy_from_slice(&chunk.data[self.current_pos..self.current_pos + n]);
+                    self.current_pos += n;
+                    filled += n;
+
+                    if self.current_pos >= chunk.data.len() {
+                        self.grow_chunk_size();
+                        self.current = None;
+                        self.current_pos = 0;
                     }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {} // channel closed, fall through to sync
+                    continue;
                 }
             }
-            // Prefetch was for wrong offset — discard it
+
+            if let Some(chunk) = self.ready.pop_front() {
+                self.current = Some(chunk);
+                self.current_pos = 0;
+                continue;
+            }
+
+            if let Some(rx) = self.in_flight.pop_front() {
+                match rx.recv() {
+                    Ok(Ok(chunk)) => {
+                        if chunk.data.is_empty() {
+                            self.eof = true;
+                            break;
+                        }
+                        self.current = Some(chunk);
+                        self.current_pos = 0;
+                        self.ensure_pipeline_full();
+                        continue;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => break, // channel closed
+                }
+            }
+            break;
         }
 
-        // Synchronous fill
-        let n = self.backend.read_at(file_offset, &mut self.data)?;
-        self.file_offset = file_offset;
-        self.valid = n;
-
-        // Start prefetching the next chunk
-        self.start_prefetch(file_offset + n as u64);
-
-        Ok(())
+        Ok(filled)
     }
 
-    /// Kick off a background prefetch for the given offset.
-    fn start_prefetch(&mut self, offset: u64) {
-        let backend = Arc::clone(&self.backend);
-        let buf_size = self.buf_size;
-        let (tx, rx) = std::sync::mpsc::channel();
+    /// Check if the cursor matches where we expect to be reading.
+    fn cursor_matches(&self, cursor: u64) -> bool {
+        if let Some(ref chunk) = self.current {
+            let expected = chunk.file_offset + self.current_pos as u64;
+            return cursor == expected;
+        }
+        if let Some(ref chunk) = self.ready.front() {
+            return cursor == chunk.file_offset;
+        }
+        if self.in_flight.is_empty() && self.ready.is_empty() && self.current.is_none() {
+            return true; // empty state, will reset anyway
+        }
+        cursor == self.next_offset && self.in_flight.is_empty()
+    }
 
-        thread::spawn(move || {
-            let mut data = vec![0u8; buf_size];
-            let result = backend.read_at(offset, &mut data).map(|n| FetchResult {
-                data,
-                file_offset: offset,
-                valid: n,
+    /// Reset the pipeline for a new cursor position (e.g., after seek).
+    pub fn reset(&mut self, offset: u64) {
+        self.current = None;
+        self.current_pos = 0;
+        self.ready.clear();
+        self.in_flight.clear();
+        self.next_offset = offset;
+        self.eof = false;
+        self.chunk_size = Self::INITIAL_CHUNK_SIZE;
+    }
+
+    fn ensure_pipeline_full(&mut self) {
+        if self.eof {
+            return;
+        }
+        while self.in_flight.len() + self.ready.len() < self.max_in_flight {
+            let offset = self.next_offset;
+            let size = self.chunk_size;
+            let backend = Arc::clone(&self.backend);
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            thread::spawn(move || {
+                let mut buf = vec![0u8; size];
+                let result = backend.read_at(offset, &mut buf).map(|n| {
+                    buf.truncate(n);
+                    Chunk {
+                        file_offset: offset,
+                        data: buf,
+                    }
+                });
+                let _ = tx.send(result);
             });
-            let _ = tx.send(result);
-        });
 
-        self.pending = Some(rx);
-        self.pending_offset = offset;
+            self.in_flight.push_back(rx);
+            self.next_offset += size as u64;
+        }
     }
 
-    /// Cancel any in-flight prefetch (e.g., after a seek).
-    pub fn cancel_prefetch(&mut self) {
-        self.pending = None;
+    fn grow_chunk_size(&mut self) {
+        if self.chunk_size < Self::MAX_CHUNK_SIZE {
+            self.chunk_size = (self.chunk_size * 2).min(Self::MAX_CHUNK_SIZE);
+        }
     }
 
     pub fn capacity(&self) -> usize {
-        self.buf_size
+        self.chunk_size
     }
 }
 
@@ -132,92 +179,90 @@ mod tests {
     use crate::backend::local::LocalBackend;
 
     #[test]
-    fn basic_fill_and_read() {
+    fn sequential_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        std::fs::write(&path, data).unwrap();
+
+        let backend = Arc::new(LocalBackend::new(&path));
+        let mut reader = PipelinedReader::new(backend, 10);
+        reader.chunk_size = 10; // small chunks for testing
+
+        let mut out = [0u8; 26];
+        let n = reader.read_into(0, &mut out).unwrap();
+        assert_eq!(n, 26);
+        assert_eq!(&out, data);
+    }
+
+    #[test]
+    fn small_reads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
         std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
 
         let backend = Arc::new(LocalBackend::new(&path));
-        let mut reader = PrefetchReader::new(backend, 10);
+        let mut reader = PipelinedReader::new(backend, 10);
+        reader.chunk_size = 10;
 
-        reader.fill(0).unwrap();
-        assert!(reader.hit(0));
-        assert!(reader.hit(9));
-        assert!(!reader.hit(10));
-
-        let mut dest = [0u8; 5];
-        let n = reader.read_into(0, &mut dest);
+        let mut buf = [0u8; 5];
+        let n = reader.read_into(0, &mut buf).unwrap();
         assert_eq!(n, 5);
-        assert_eq!(&dest, b"abcde");
+        assert_eq!(&buf, b"abcde");
+
+        let n = reader.read_into(5, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"fghij");
     }
 
     #[test]
-    fn prefetch_hits_on_sequential_access() {
+    fn read_after_reset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
         std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
 
         let backend = Arc::new(LocalBackend::new(&path));
-        let mut reader = PrefetchReader::new(backend, 10);
+        let mut reader = PipelinedReader::new(backend, 10);
+        reader.chunk_size = 10;
 
-        // First fill at 0 — also starts prefetch at 10
-        reader.fill(0).unwrap();
+        let mut buf = [0u8; 5];
+        reader.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"abcde");
 
-        // Give prefetch thread time to complete
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Second fill at 10 should use prefetched data
-        reader.fill(10).unwrap();
-        assert!(reader.hit(10));
-
-        let mut dest = [0u8; 5];
-        let n = reader.read_into(10, &mut dest);
+        reader.reset(20);
+        let n = reader.read_into(20, &mut buf).unwrap();
         assert_eq!(n, 5);
-        assert_eq!(&dest, b"klmno");
+        assert_eq!(&buf, b"uvwxy");
     }
 
     #[test]
-    fn seek_invalidates_prefetch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
-
-        let backend = Arc::new(LocalBackend::new(&path));
-        let mut reader = PrefetchReader::new(backend, 10);
-
-        reader.fill(0).unwrap();
-        reader.cancel_prefetch();
-
-        // Fill at non-sequential offset — no prefetch to use
-        reader.fill(20).unwrap();
-        assert!(reader.hit(20));
-
-        let mut dest = [0u8; 5];
-        let n = reader.read_into(20, &mut dest);
-        assert_eq!(n, 5);
-        assert_eq!(&dest, b"uvwxy");
-    }
-
-    #[test]
-    fn empty_buffer_has_no_hits() {
+    fn empty_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
         std::fs::write(&path, b"data").unwrap();
 
         let backend = Arc::new(LocalBackend::new(&path));
-        let reader = PrefetchReader::new(backend, 1024);
-        assert!(!reader.hit(0));
+        let mut reader = PipelinedReader::new(backend, 1024);
+
+        let mut buf = [0u8; 0];
+        let n = reader.read_into(0, &mut buf).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
-    fn read_into_miss_returns_zero() {
+    fn chunk_size_grows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"data").unwrap();
+        let data = vec![0xABu8; 10 * 1024 * 1024];
+        std::fs::write(&path, &data).unwrap();
 
         let backend = Arc::new(LocalBackend::new(&path));
-        let reader = PrefetchReader::new(backend, 1024);
-        let mut dest = [0u8; 5];
-        assert_eq!(reader.read_into(0, &mut dest), 0);
+        let mut reader = PipelinedReader::new(backend, 1024);
+        assert_eq!(reader.chunk_size, PipelinedReader::INITIAL_CHUNK_SIZE);
+
+        let mut out = vec![0u8; 5 * 1024 * 1024];
+        reader.read_into(0, &mut out).unwrap();
+
+        assert!(reader.chunk_size > PipelinedReader::INITIAL_CHUNK_SIZE);
     }
 }
