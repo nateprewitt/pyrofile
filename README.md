@@ -1,7 +1,7 @@
 # pyrofile
 
 File-like object for accessing local and cloud storage.
-Written in Rust, with the goal of supporting most modern cloud storage platforms.
+Built in Rust with growing support for major cloud storage platforms.
 
 ## Install
 
