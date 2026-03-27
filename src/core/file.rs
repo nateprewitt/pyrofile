@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::backend::traits::{ObjectWriter, StorageBackend};
-use crate::core::buffer::ReadBuffer;
+use crate::core::buffer::PrefetchReader;
 use crate::core::config::PyroIOConfig;
 use crate::error::{PyroError, Result};
 
@@ -21,7 +21,7 @@ pub struct PyroIO {
     /// Cached file size from metadata; None until first access.
     size: Option<u64>,
     closed: bool,
-    read_buf: ReadBuffer,
+    reader: PrefetchReader,
     writer: Option<Box<dyn ObjectWriter>>,
 }
 
@@ -32,13 +32,14 @@ impl PyroIO {
         mode: OpenMode,
         config: PyroIOConfig,
     ) -> Self {
+        let reader = PrefetchReader::new(Arc::clone(&backend), config.read_buffer_size);
         Self {
             backend,
             mode,
             cursor: 0,
             size: None,
             closed: false,
-            read_buf: ReadBuffer::new(config.read_buffer_size),
+            reader,
             writer: None,
         }
     }
@@ -66,19 +67,17 @@ impl PyroIO {
         let mut filled = 0;
 
         while filled < size {
-            let copied = self.read_buf.read_into(self.cursor, &mut out[filled..]);
+            let copied = self.reader.read_into(self.cursor, &mut out[filled..]);
             if copied > 0 {
                 filled += copied;
                 self.cursor += copied as u64;
                 continue;
             }
 
-            // Buffer miss — refill from backend.
-            let read_offset = self.cursor;
-            self.read_buf
-                .fill_from_backend(read_offset, self.backend.as_ref())?;
+            // Buffer miss - refill from backend.
+            self.reader.fill(self.cursor)?;
 
-            let copied = self.read_buf.read_into(self.cursor, &mut out[filled..]);
+            let copied = self.reader.read_into(self.cursor, &mut out[filled..]);
             if copied == 0 {
                 break;
             }
@@ -151,6 +150,9 @@ impl PyroIO {
 
         match new_pos {
             Some(p) => {
+                if !self.reader.hit(p) {
+                    self.reader.cancel_prefetch();
+                }
                 self.cursor = p;
                 Ok(p)
             }

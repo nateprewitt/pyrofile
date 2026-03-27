@@ -17,7 +17,7 @@ mod azure_impl {
 
     /// Azure Blob Storage backend.
     pub struct AzureBackend {
-        blob_client: BlobClient,
+        blob_client: Arc<BlobClient>,
         blob_url: url::Url,
         runtime: Arc<Runtime>,
         blob_url_str: String,
@@ -59,7 +59,7 @@ mod azure_impl {
                 .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))?;
 
             Ok(Self {
-                blob_client,
+                blob_client: Arc::new(blob_client),
                 blob_url: parsed_url,
                 runtime: Arc::new(runtime),
                 blob_url_str: blob_url.to_string(),
@@ -102,7 +102,7 @@ mod azure_impl {
         fn download_chunked(&self, offset: u64, length: usize) -> Result<Vec<(usize, Bytes)>> {
             let partition_size = Self::READ_PARTITION_SIZE;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_READS));
-            let blob_url = self.blob_url.clone();
+            let client = Arc::clone(&self.blob_client);
 
             let results: Vec<std::result::Result<(usize, Bytes), PyroError>> =
                 self.block_on_safe(async {
@@ -113,20 +113,13 @@ mod azure_impl {
                         let chunk_len = partition_size.min(length - pos);
                         let chunk_offset = offset + pos as u64;
                         let buf_pos = pos;
-                        let url = blob_url.clone();
+                        let c = Arc::clone(&client);
                         let sem = Arc::clone(&semaphore);
 
                         handles.push(tokio::spawn(async move {
                             let _permit = sem.acquire().await.map_err(|e| {
                                 PyroError::Backend(format!("semaphore error: {e}"))
                             })?;
-
-                            let client = BlobClient::from_url(
-                                url,
-                                None::<Arc<dyn azure_core::credentials::TokenCredential>>,
-                                None,
-                            )
-                            .map_err(|e| PyroError::Backend(format!("client error: {e}")))?;
 
                             let mut options = BlobClientDownloadOptions::default();
                             options.range = Some(format!(
@@ -136,7 +129,7 @@ mod azure_impl {
                             ));
 
                             let response =
-                                client.download(Some(options)).await.map_err(|e| {
+                                c.download(Some(options)).await.map_err(|e| {
                                     PyroError::Backend(format!("download error: {e}"))
                                 })?;
                             let body: Bytes =
