@@ -1,6 +1,6 @@
 use crate::backend::traits::StorageBackend;
 use crate::core::config::ReadConfig;
-use crate::error::Result;
+use crate::error::{PyroError, Result};
 
 /// A single cached block of file data.
 struct Block {
@@ -17,6 +17,8 @@ pub(crate) struct BlockCache {
     blocks: Vec<Block>,
     block_size: usize,
     max_blocks: usize,
+    parallel_chunk_size: usize,
+    max_read_concurrency: usize,
     access_counter: u64,
 }
 
@@ -26,13 +28,13 @@ impl BlockCache {
             blocks: Vec::with_capacity(config.max_blocks),
             block_size: config.block_size,
             max_blocks: config.max_blocks,
+            parallel_chunk_size: config.parallel_chunk_size,
+            max_read_concurrency: config.max_read_concurrency,
             access_counter: 0,
         }
     }
 
-    /// Read from the cache into `dest`, starting at the given file `cursor`.
-    /// Fetches blocks from the backend on cache miss. Returns the number
-    /// of bytes copied.
+    /// Read into `dest` starting at file position `cursor`.
     pub fn read(
         &mut self,
         cursor: u64,
@@ -43,6 +45,26 @@ impl BlockCache {
             return Ok(0);
         }
 
+        if dest.len() > self.block_size * 2 {
+            return Self::parallel_read(
+                cursor,
+                dest,
+                backend,
+                self.parallel_chunk_size,
+                self.max_read_concurrency,
+            );
+        }
+
+        self.cached_read(cursor, dest, backend)
+    }
+
+    /// Small-read path: serve from the LRU block cache.
+    fn cached_read(
+        &mut self,
+        cursor: u64,
+        dest: &mut [u8],
+        backend: &dyn StorageBackend,
+    ) -> Result<usize> {
         let mut filled = 0;
         let mut pos = cursor;
 
@@ -64,6 +86,94 @@ impl BlockCache {
         }
 
         Ok(filled)
+    }
+
+    /// Download into `dest` using concurrent workers.
+    fn parallel_read(
+        cursor: u64,
+        dest: &mut [u8],
+        backend: &dyn StorageBackend,
+        max_chunk_size: usize,
+        max_concurrency: usize,
+    ) -> Result<usize> {
+        const MIN_CHUNK: usize = 2 * 1024 * 1024; // 2 MB floor
+
+        let total_len = dest.len();
+
+        let max_useful_workers = (total_len.div_ceil(MIN_CHUNK)).max(1);
+        let num_workers = max_concurrency.min(max_useful_workers);
+
+        if num_workers <= 1 {
+            let n = backend.read_at(cursor, dest)?;
+            return Ok(n);
+        }
+
+        let per_worker = total_len.div_ceil(num_workers);
+        let effective_chunk = per_worker.min(max_chunk_size);
+
+        let first_err: std::sync::Mutex<Option<PyroError>> = std::sync::Mutex::new(None);
+        let worker_results: std::sync::Mutex<Vec<(usize, usize)>> =
+            std::sync::Mutex::new(Vec::with_capacity(num_workers));
+
+        std::thread::scope(|s| {
+            let mut remaining = &mut *dest;
+            let mut offset = cursor;
+            let mut worker_idx = 0;
+
+            while !remaining.is_empty() {
+                let this_len = remaining.len().min(per_worker);
+                let (this_slice, rest) = remaining.split_at_mut(this_len);
+                remaining = rest;
+                let this_offset = offset;
+                let this_worker = worker_idx;
+                offset += this_len as u64;
+                worker_idx += 1;
+
+                let err_ref = &first_err;
+                let results_ref = &worker_results;
+
+                s.spawn(move || {
+                    let mut filled = 0;
+                    let mut pos = this_offset;
+
+                    while filled < this_slice.len() {
+                        if err_ref.lock().unwrap().is_some() {
+                            return;
+                        }
+
+                        let read_len = (this_slice.len() - filled).min(effective_chunk);
+                        match backend.read_at(pos, &mut this_slice[filled..filled + read_len]) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                filled += n;
+                                pos += n as u64;
+                            }
+                            Err(e) => {
+                                let mut guard = err_ref.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    results_ref
+                        .lock()
+                        .unwrap()
+                        .push((this_worker, filled));
+                });
+            }
+        });
+
+        if let Some(e) = first_err.into_inner().unwrap() {
+            return Err(e);
+        }
+
+        let mut results = worker_results.into_inner().unwrap();
+        results.sort_by_key(|(idx, _)| *idx);
+        let total_filled: usize = results.iter().map(|(_, n)| n).sum();
+        Ok(total_filled)
     }
 
     /// Look up or fetch the block starting at `block_start`.
@@ -129,6 +239,7 @@ mod tests {
         ReadConfig {
             block_size,
             max_blocks,
+            ..Default::default()
         }
     }
 
@@ -272,5 +383,96 @@ mod tests {
 
         assert_eq!(cache.blocks[0].start, 0);
         assert_eq!(cache.blocks[0].data.len(), 8);
+    }
+
+    #[test]
+    fn parallel_read_large_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        // 1MB of data, block_size=4 so threshold is 8 bytes
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let backend = LocalBackend::new(&path);
+        let config = ReadConfig {
+            block_size: 4,
+            max_blocks: 2,
+            parallel_chunk_size: 1024,
+            max_read_concurrency: 4,
+        };
+        let mut cache = BlockCache::new(&config);
+
+        let mut buf = vec![0u8; 1024 * 1024];
+        let n = cache.read(0, &mut buf, &backend).unwrap();
+        assert_eq!(n, 1024 * 1024);
+        assert_eq!(buf, data);
+
+        assert!(cache.blocks.is_empty());
+    }
+
+    #[test]
+    fn parallel_read_at_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let backend = LocalBackend::new(&path);
+        let config = ReadConfig {
+            block_size: 4,
+            max_blocks: 2,
+            parallel_chunk_size: 256,
+            max_read_concurrency: 4,
+        };
+        let mut cache = BlockCache::new(&config);
+
+        let mut buf = vec![0u8; 2048];
+        let n = cache.read(1000, &mut buf, &backend).unwrap();
+        assert_eq!(n, 2048);
+        assert_eq!(buf, data[1000..3048]);
+    }
+
+    #[test]
+    fn parallel_read_hits_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        std::fs::write(&path, b"short").unwrap();
+
+        let backend = LocalBackend::new(&path);
+        let config = ReadConfig {
+            block_size: 2,
+            max_blocks: 2,
+            parallel_chunk_size: 4,
+            max_read_concurrency: 4,
+        };
+        let mut cache = BlockCache::new(&config);
+
+        let mut buf = vec![0u8; 100];
+        let n = cache.read(0, &mut buf, &backend).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"short");
+    }
+
+    #[test]
+    fn threshold_boundary_uses_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        std::fs::write(&path, b"aabbccddee").unwrap();
+
+        let backend = LocalBackend::new(&path);
+        let config = ReadConfig {
+            block_size: 4,
+            max_blocks: 4,
+            parallel_chunk_size: 1024,
+            max_read_concurrency: 4,
+        };
+        let mut cache = BlockCache::new(&config);
+
+        let mut buf = [0u8; 8];
+        let n = cache.read(0, &mut buf, &backend).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"aabbccdd");
+
+        assert!(!cache.blocks.is_empty());
     }
 }

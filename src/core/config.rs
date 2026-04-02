@@ -19,6 +19,15 @@ pub struct ReadConfig {
     /// Total memory usage is up to `block_size * max_blocks`.
     /// Default: 4
     pub max_blocks: usize,
+
+    /// Chunk size for parallel bulk downloads in bytes. Used when a read
+    /// exceeds the parallel threshold. Independent of `block_size`.
+    /// Default: 16 MB.
+    pub parallel_chunk_size: usize,
+
+    /// Maximum number of concurrent download threads for bulk reads.
+    /// Default: 8.
+    pub max_read_concurrency: usize,
 }
 
 /// Configuration for write operations (passed to SmartWriter).
@@ -45,8 +54,10 @@ impl Default for PyroIOConfig {
 impl Default for ReadConfig {
     fn default() -> Self {
         Self {
-            block_size: 8 * 1024 * 1024, // 8 MB
-            max_blocks: 4,               // 32 MB total
+            block_size: 8 * 1024 * 1024,          // 8 MB
+            max_blocks: 4,                         // 32 MB total
+            parallel_chunk_size: 16 * 1024 * 1024, // 16 MB
+            max_read_concurrency: 32,
         }
     }
 }

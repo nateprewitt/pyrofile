@@ -410,6 +410,7 @@ mod tests {
             read_config: crate::core::config::ReadConfig {
                 block_size: 4,  // tiny blocks to exercise multi-block reads
                 max_blocks: 2,
+                ..Default::default()
             },
             ..Default::default()
         };
