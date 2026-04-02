@@ -1053,6 +1053,7 @@ dependencies = [
  "azure_identity",
  "azure_storage_blob",
  "base64",
+ "futures",
  "openssl-sys",
  "pyo3",
  "tempfile",
