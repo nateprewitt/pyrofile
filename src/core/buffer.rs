@@ -220,12 +220,7 @@ impl BlockCache {
 
     /// Align a file offset down to the nearest block boundary.
     fn align(&self, offset: u64) -> u64 {
-        (offset / self.block_size as u64) * self.block_size as u64
-    }
-
-    /// Returns the configured block size.
-    pub fn block_size(&self) -> usize {
-        self.block_size
+        offset - (offset % self.block_size as u64)
     }
 }
 
@@ -233,13 +228,13 @@ impl BlockCache {
 mod tests {
     use super::*;
     use crate::backend::local::LocalBackend;
-    use std::sync::Arc;
 
     fn test_config(block_size: usize, max_blocks: usize) -> ReadConfig {
         ReadConfig {
             block_size,
             max_blocks,
-            ..Default::default()
+            parallel_chunk_size: 16 * 1024 * 1024,
+            max_read_concurrency: 32,
         }
     }
 

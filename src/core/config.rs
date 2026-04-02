@@ -11,22 +11,16 @@ pub struct PyroIOConfig {
 /// Read configuration for the block cache and parallel downloads.
 #[derive(Debug, Clone)]
 pub struct ReadConfig {
-    /// Size of each cache block in bytes. Reads are aligned to this boundary.
-    /// Default: 8 MB.
+    /// Cache block size in bytes. Default: 16 MB.
     pub block_size: usize,
 
-    /// Maximum number of blocks to keep in the LRU cache.
-    /// Total memory usage is up to `block_size * max_blocks`.
-    /// Default: 4
+    /// Maximum cached blocks. Default: 4 (64 MB total).
     pub max_blocks: usize,
 
-    /// Chunk size for parallel bulk downloads in bytes. Used when a read
-    /// exceeds the parallel threshold. Independent of `block_size`.
-    /// Default: 16 MB.
+    /// Chunk size per HTTP request in parallel downloads. Default: 16 MB.
     pub parallel_chunk_size: usize,
 
-    /// Maximum number of concurrent download threads for bulk reads.
-    /// Default: 8.
+    /// Maximum concurrent download threads. Default: 32.
     pub max_read_concurrency: usize,
 }
 
@@ -54,8 +48,8 @@ impl Default for PyroIOConfig {
 impl Default for ReadConfig {
     fn default() -> Self {
         Self {
-            block_size: 8 * 1024 * 1024,          // 8 MB
-            max_blocks: 4,                         // 32 MB total
+            block_size: 16 * 1024 * 1024,         // 16 MB
+            max_blocks: 4,                         // 64 MB total
             parallel_chunk_size: 16 * 1024 * 1024, // 16 MB
             max_read_concurrency: 32,
         }

@@ -89,10 +89,12 @@ impl PyroIO {
         if self.cursor >= file_size {
             return Ok(Vec::new());
         }
-        let remaining = file_size - self.cursor;
-        let data = self.backend.download(self.cursor, remaining)?;
-        self.cursor += data.len() as u64;
-        Ok(data)
+        let remaining = (file_size - self.cursor) as usize;
+        let mut out = vec![0u8; remaining];
+        let filled = self.cache.read(self.cursor, &mut out, self.backend.as_ref())?;
+        self.cursor += filled as u64;
+        out.truncate(filled);
+        Ok(out)
     }
 
     /// Write data. Returns the number of bytes written (always == data.len()).
@@ -410,9 +412,13 @@ mod tests {
             read_config: crate::core::config::ReadConfig {
                 block_size: 4,  // tiny blocks to exercise multi-block reads
                 max_blocks: 2,
-                ..Default::default()
+                parallel_chunk_size: 16 * 1024 * 1024,
+                max_read_concurrency: 32,
             },
-            ..Default::default()
+            write_config: crate::core::config::WriteConfig {
+                part_size: 8 * 1024 * 1024,
+                put_max: 5 * 1024 * 1024 * 1024,
+            },
         };
         let backend = Arc::new(LocalBackend::new(&path));
         let mut f = PyroIO::new(backend, OpenMode::Read, config);
