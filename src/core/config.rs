@@ -1,11 +1,24 @@
 /// Configuration for [`PyroIO`](super::file::PyroIO).
 #[derive(Debug, Clone)]
 pub struct PyroIOConfig {
-    /// Size of the read-ahead buffer in bytes. Default: 16 MB.
-    pub read_buffer_size: usize,
+    /// Read cache configuration.
+    pub read_config: ReadConfig,
 
     /// Write configuration passed through to SmartWriter.
     pub write_config: WriteConfig,
+}
+
+/// Read configuration for the block cache and parallel downloads.
+#[derive(Debug, Clone)]
+pub struct ReadConfig {
+    /// Size of each cache block in bytes. Reads are aligned to this boundary.
+    /// Default: 8 MB.
+    pub block_size: usize,
+
+    /// Maximum number of blocks to keep in the LRU cache.
+    /// Total memory usage is up to `block_size * max_blocks`.
+    /// Default: 4
+    pub max_blocks: usize,
 }
 
 /// Configuration for write operations (passed to SmartWriter).
@@ -23,8 +36,17 @@ pub struct WriteConfig {
 impl Default for PyroIOConfig {
     fn default() -> Self {
         Self {
-            read_buffer_size: 16 * 1024 * 1024, // 16 MB
+            read_config: ReadConfig::default(),
             write_config: WriteConfig::default(),
+        }
+    }
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            block_size: 8 * 1024 * 1024, // 8 MB
+            max_blocks: 4,               // 32 MB total
         }
     }
 }

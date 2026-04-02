@@ -120,6 +120,32 @@ impl PyPyroFile {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    fn readinto(&self, py: Python<'_>, buffer: PyBuffer<u8>) -> PyResult<usize> {
+        if buffer.readonly() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "readinto requires a writable buffer",
+            ));
+        }
+        if !buffer.is_c_contiguous() {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "readinto requires a contiguous buffer",
+            ));
+        }
+
+        let ptr = buffer.buf_ptr() as *mut u8;
+        let len = buffer.len_bytes();
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: We verified the buffer is contiguous.
+        let dest = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+
+        py.allow_threads(|| self.lock_inner()?.read_into(dest))
+            .map_err(|e: PyroError| e.into())
+    }
+
     fn write(&self, py: Python<'_>, data: PyBuffer<u8>) -> PyResult<usize> {
         let buf = data.to_vec(py)?;
         py.allow_threads(|| self.lock_inner()?.write(&buf))

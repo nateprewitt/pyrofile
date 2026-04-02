@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::backend::traits::{ObjectWriter, StorageBackend};
-use crate::core::buffer::ReadBuffer;
+use crate::core::buffer::BlockCache;
 use crate::core::config::PyroIOConfig;
 use crate::error::{PyroError, Result};
 
@@ -21,7 +21,7 @@ pub struct PyroIO {
     /// Cached file size from metadata; None until first access.
     size: Option<u64>,
     closed: bool,
-    read_buf: ReadBuffer,
+    cache: BlockCache,
     writer: Option<Box<dyn ObjectWriter>>,
 }
 
@@ -38,7 +38,7 @@ impl PyroIO {
             cursor: 0,
             size: None,
             closed: false,
-            read_buf: ReadBuffer::new(config.read_buffer_size),
+            cache: BlockCache::new(&config.read_config),
             writer: None,
         }
     }
@@ -63,31 +63,24 @@ impl PyroIO {
 
         let size = size as usize;
         let mut out = vec![0u8; size];
-        let mut filled = 0;
-
-        while filled < size {
-            let copied = self.read_buf.read_into(self.cursor, &mut out[filled..]);
-            if copied > 0 {
-                filled += copied;
-                self.cursor += copied as u64;
-                continue;
-            }
-
-            // Buffer miss — refill from backend.
-            let read_offset = self.cursor;
-            self.read_buf
-                .fill_from_backend(read_offset, self.backend.as_ref())?;
-
-            let copied = self.read_buf.read_into(self.cursor, &mut out[filled..]);
-            if copied == 0 {
-                break;
-            }
-            filled += copied;
-            self.cursor += copied as u64;
-        }
-
+        let filled = self.cache.read(self.cursor, &mut out, self.backend.as_ref())?;
+        self.cursor += filled as u64;
         out.truncate(filled);
         Ok(out)
+    }
+
+    /// Read directly into a caller-provided buffer.
+    pub fn read_into(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.mode != OpenMode::Read {
+            return Err(PyroError::NotSupported);
+        }
+        if self.closed {
+            return Err(PyroError::Closed);
+        }
+
+        let filled = self.cache.read(self.cursor, buf, self.backend.as_ref())?;
+        self.cursor += filled as u64;
+        Ok(filled)
     }
 
     /// Read all remaining bytes from cursor to EOF.
@@ -414,7 +407,10 @@ mod tests {
         write_test_file(&path, b"abcdefghijklmnopqrstuvwxyz");
 
         let config = PyroIOConfig {
-            read_buffer_size: 4, // tiny buffer to exercise refill
+            read_config: crate::core::config::ReadConfig {
+                block_size: 4,  // tiny blocks to exercise multi-block reads
+                max_blocks: 2,
+            },
             ..Default::default()
         };
         let backend = Arc::new(LocalBackend::new(&path));
