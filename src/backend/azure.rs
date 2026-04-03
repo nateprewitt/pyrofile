@@ -226,7 +226,19 @@ mod azure_impl {
         }
 
         fn flush(&mut self) -> Result<()> {
-            self.wait_for_in_flight()
+            // Surface errors from finished transfers early.
+            let mut still_running = Vec::new();
+            for handle in self.in_flight.drain(..) {
+                if handle.is_finished() {
+                    self.runtime
+                        .block_on(handle)
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                } else {
+                    still_running.push(handle);
+                }
+            }
+            self.in_flight = still_running;
+            Ok(())
         }
 
         fn close(&mut self) -> Result<()> {
