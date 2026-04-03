@@ -25,7 +25,7 @@ mod azure_impl {
 
     impl AzureBackend {
         const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
-        const MAX_CONCURRENT_UPLOADS: usize = 32;
+        const MAX_CONCURRENT_UPLOADS: usize = 64;
 
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
