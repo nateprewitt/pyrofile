@@ -139,7 +139,8 @@ impl PyPyroFile {
             return Ok(0);
         }
 
-        // SAFETY: We verified the buffer is contiguous.
+        // SAFETY: We verified the buffer is contiguous,
+        // so buf_ptr() is valid for len_bytes() bytes.
         let dest = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 
         py.allow_threads(|| self.lock_inner()?.read_into(dest))
@@ -147,9 +148,29 @@ impl PyPyroFile {
     }
 
     fn write(&self, py: Python<'_>, data: PyBuffer<u8>) -> PyResult<usize> {
-        let buf = data.to_vec(py)?;
-        py.allow_threads(|| self.lock_inner()?.write(&buf))
-            .map_err(|e: PyroError| e.into())
+        if !data.is_c_contiguous() {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "write requires a contiguous buffer",
+            ));
+        }
+
+        let ptr = data.buf_ptr() as *const u8;
+        let len = data.len_bytes();
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: We verified the buffer is contiguous,
+        // so buf_ptr() is valid for len_bytes() bytes.
+        let src = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        let start = std::time::Instant::now();
+        let result = py.allow_threads(|| self.lock_inner()?.write(src))
+            .map_err(|e: PyroError| e.into());
+        let elapsed = start.elapsed();
+        eprintln!("[write] size={len} elapsed={elapsed:?}");
+        result
     }
 
     #[pyo3(signature = (offset, whence=0))]
@@ -178,13 +199,19 @@ impl PyPyroFile {
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.lock_inner()?.flush())
-            .map_err(|e: PyroError| e.into())
+        let start = std::time::Instant::now();
+        let result = py.allow_threads(|| self.lock_inner()?.flush())
+            .map_err(|e: PyroError| e.into());
+        eprintln!("[flush] elapsed={:?}", start.elapsed());
+        result
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.lock_inner()?.close())
-            .map_err(|e: PyroError| e.into())
+        let start = std::time::Instant::now();
+        let result = py.allow_threads(|| self.lock_inner()?.close())
+            .map_err(|e: PyroError| e.into());
+        eprintln!("[close] elapsed={:?}", start.elapsed());
+        result
     }
 
     fn readable(&self) -> PyResult<bool> {
