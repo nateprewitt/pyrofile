@@ -4,6 +4,18 @@
 
 - Nothing yet.
 
+ ## [0.2.0] - 2026-04-03
+
+ ### Performance
+
+ - Added read caching to avoid redundant fetches for seek-heavy workloads
+   like ``torch.load``.
+ - Large downloads are now parallelized after exceeding cache threshold.
+
+ ### Feature
+
+ - Added `readinto()` support.
+
 ## [0.1.0] - 2026-03-26
 
 ### Feature
