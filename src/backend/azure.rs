@@ -181,6 +181,7 @@ mod azure_impl {
 
                 let body: RequestContent<Bytes, NoFormat> = Bytes::from(data).into();
 
+                let start = std::time::Instant::now();
                 client
                     .stage_block(
                         &block_id,
@@ -190,6 +191,7 @@ mod azure_impl {
                     )
                     .await
                     .map_err(|e| PyroError::Backend(format!("stage_block error: {e}")))?;
+                eprintln!("[stage_block] size={content_length} elapsed={:?}", start.elapsed());
 
                 Ok(())
             });
@@ -200,11 +202,16 @@ mod azure_impl {
 
         fn wait_for_in_flight(&mut self) -> Result<()> {
             let handles: Vec<_> = self.in_flight.drain(..).collect();
-            for handle in handles {
-                self.runtime
-                    .block_on(handle)
-                    .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+            if handles.is_empty() {
+                return Ok(());
             }
+            self.runtime.block_on(async {
+                for handle in handles {
+                    handle.await
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                }
+                Ok::<(), PyroError>(())
+            })?;
             Ok(())
         }
     }
