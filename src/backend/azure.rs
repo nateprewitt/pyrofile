@@ -24,8 +24,8 @@ mod azure_impl {
     }
 
     impl AzureBackend {
-        const BLOCK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
-        const MAX_CONCURRENT_UPLOADS: usize = 8;
+        const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+        const MAX_CONCURRENT_UPLOADS: usize = 64;
 
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
@@ -200,11 +200,16 @@ mod azure_impl {
 
         fn wait_for_in_flight(&mut self) -> Result<()> {
             let handles: Vec<_> = self.in_flight.drain(..).collect();
-            for handle in handles {
-                self.runtime
-                    .block_on(handle)
-                    .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+            if handles.is_empty() {
+                return Ok(());
             }
+            self.runtime.block_on(async {
+                for handle in handles {
+                    handle.await
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                }
+                Ok::<(), PyroError>(())
+            })?;
             Ok(())
         }
     }
@@ -226,7 +231,19 @@ mod azure_impl {
         }
 
         fn flush(&mut self) -> Result<()> {
-            self.wait_for_in_flight()
+            // Surface errors from finished transfers early.
+            let mut still_running = Vec::new();
+            for handle in self.in_flight.drain(..) {
+                if handle.is_finished() {
+                    self.runtime
+                        .block_on(handle)
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                } else {
+                    still_running.push(handle);
+                }
+            }
+            self.in_flight = still_running;
+            Ok(())
         }
 
         fn close(&mut self) -> Result<()> {

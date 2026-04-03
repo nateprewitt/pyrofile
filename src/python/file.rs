@@ -139,7 +139,8 @@ impl PyPyroFile {
             return Ok(0);
         }
 
-        // SAFETY: We verified the buffer is contiguous.
+        // SAFETY: We verified the buffer is contiguous,
+        // so buf_ptr() is valid for len_bytes() bytes.
         let dest = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 
         py.allow_threads(|| self.lock_inner()?.read_into(dest))
@@ -147,8 +148,24 @@ impl PyPyroFile {
     }
 
     fn write(&self, py: Python<'_>, data: PyBuffer<u8>) -> PyResult<usize> {
-        let buf = data.to_vec(py)?;
-        py.allow_threads(|| self.lock_inner()?.write(&buf))
+        if !data.is_c_contiguous() {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "write requires a contiguous buffer",
+            ));
+        }
+
+        let ptr = data.buf_ptr() as *const u8;
+        let len = data.len_bytes();
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: We verified the buffer is contiguous,
+        // so buf_ptr() is valid for len_bytes() bytes.
+        let src = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        py.allow_threads(|| self.lock_inner()?.write(src))
             .map_err(|e: PyroError| e.into())
     }
 
