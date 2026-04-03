@@ -4,15 +4,21 @@
 
 - Nothing yet.
 
- ## [0.2.0] - 2026-04-03
+## [0.2.1] - 2026-04-03
 
- ### Performance
+### Performance
 
- - Added read caching to avoid redundant fetches for seek-heavy workloads
-   like ``torch.load``.
- - Large downloads are now parallelized after exceeding cache threshold.
+- Optimized parallelization and write strategy for Azure backend.
 
- ### Feature
+## [0.2.0] - 2026-04-02
+
+### Performance
+
+- Added read caching to avoid redundant fetches for seek-heavy workloads
+  like ``torch.load``.
+- Large downloads are now parallelized after exceeding cache threshold.
+
+### Feature
 
  - Added `readinto()` support.
 
