@@ -220,29 +220,34 @@ mod azure_impl {
                 return Err(PyroError::Closed);
             }
             self.buffer.extend_from_slice(data);
+            eprintln!("[azure_write] data={} buf={} in_flight={}", data.len(), self.buffer.len(), self.in_flight.len());
 
             while self.buffer.len() >= self.block_size {
                 let remainder = self.buffer.split_off(self.block_size);
                 let block_data = std::mem::replace(&mut self.buffer, remainder);
                 self.spawn_block_upload(block_data)?;
+                eprintln!("[azure_write] staged block, buf={} in_flight={}", self.buffer.len(), self.in_flight.len());
             }
 
             Ok(())
         }
 
         fn flush(&mut self) -> Result<()> {
-            // Surface errors from finished transfers early.
+            let start = std::time::Instant::now();
             let mut still_running = Vec::new();
+            let mut completed = 0;
             for handle in self.in_flight.drain(..) {
                 if handle.is_finished() {
                     self.runtime
                         .block_on(handle)
                         .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                    completed += 1;
                 } else {
                     still_running.push(handle);
                 }
             }
             self.in_flight = still_running;
+            eprintln!("[azure_flush] completed={completed} still_running={} elapsed={:?}", self.in_flight.len(), start.elapsed());
             Ok(())
         }
 
@@ -251,13 +256,19 @@ mod azure_impl {
                 return Ok(());
             }
 
+            eprintln!("[azure_close] starting: buf={} in_flight={} blocks_staged={}", self.buffer.len(), self.in_flight.len(), self.block_ids.len());
+            let start = std::time::Instant::now();
+
             if !self.buffer.is_empty() {
                 let data = std::mem::take(&mut self.buffer);
                 self.spawn_block_upload(data)?;
             }
 
+            let wait_start = std::time::Instant::now();
             self.wait_for_in_flight()?;
+            eprintln!("[azure_close] wait_for_in_flight={:?}", wait_start.elapsed());
 
+            let commit_start = std::time::Instant::now();
             let block_list = BlockLookupList {
                 committed: None,
                 uncommitted: Some(self.block_ids.clone()),
@@ -279,6 +290,7 @@ mod azure_impl {
                             PyroError::Backend(format!("commit_block_list error: {e}"))
                         })
                 })?;
+            eprintln!("[azure_close] commit={:?} total={:?}", commit_start.elapsed(), start.elapsed());
 
             self.closed = true;
             Ok(())
