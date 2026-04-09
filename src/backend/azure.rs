@@ -10,7 +10,6 @@ mod azure_impl {
     use azure_storage_blob::{BlobClient, BlobClientOptions, BlockBlobClient};
     use futures::StreamExt;
     use tokio::runtime::Runtime;
-    use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
 
     use crate::backend::traits::{ObjectMeta, ObjectWriter, StorageBackend};
@@ -141,7 +140,6 @@ mod azure_impl {
                 buffer: Vec::new(),
                 block_ids: Vec::new(),
                 in_flight: Vec::new(),
-                semaphore: Arc::new(Semaphore::new(Self::MAX_CONCURRENT_UPLOADS)),
                 block_size: Self::BLOCK_SIZE,
                 closed: false,
             }))
@@ -159,26 +157,27 @@ mod azure_impl {
         buffer: Vec<u8>,
         block_ids: Vec<Vec<u8>>,
         in_flight: Vec<JoinHandle<Result<()>>>,
-        semaphore: Arc<Semaphore>,
         block_size: usize,
         closed: bool,
     }
 
     impl AzureWriter {
         fn spawn_block_upload(&mut self, data: Vec<u8>) -> Result<()> {
+            if self.in_flight.len() >= AzureBackend::MAX_CONCURRENT_UPLOADS {
+                self.drain_completed()?;
+            }
+            // If still at the cap after draining, wait for one to finish.
+            if self.in_flight.len() >= AzureBackend::MAX_CONCURRENT_UPLOADS {
+                self.wait_for_one()?;
+            }
+
             let block_id = uuid::Uuid::new_v4().to_string().into_bytes();
             self.block_ids.push(block_id.clone());
 
             let client = Arc::clone(&self.block_blob_client);
-            let semaphore = Arc::clone(&self.semaphore);
             let content_length = data.len() as u64;
 
             let handle = self.runtime.spawn(async move {
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| PyroError::Backend(format!("semaphore error: {e}")))?;
-
                 let body: RequestContent<Bytes, NoFormat> = Bytes::from(data).into();
 
                 client
@@ -195,6 +194,35 @@ mod azure_impl {
             });
 
             self.in_flight.push(handle);
+            Ok(())
+        }
+
+        /// Drain completed tasks.
+        fn drain_completed(&mut self) -> Result<()> {
+            let mut still_running = Vec::new();
+            for handle in self.in_flight.drain(..) {
+                if handle.is_finished() {
+                    self.runtime
+                        .block_on(handle)
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                } else {
+                    still_running.push(handle);
+                }
+            }
+            self.in_flight = still_running;
+            Ok(())
+        }
+
+        /// Block until at least one task completes.
+        fn wait_for_one(&mut self) -> Result<()> {
+            if self.in_flight.is_empty() {
+                return Ok(());
+            }
+            // Wait for the oldest task (most likely to finish first).
+            let handle = self.in_flight.remove(0);
+            self.runtime
+                .block_on(handle)
+                .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
             Ok(())
         }
 
@@ -219,36 +247,39 @@ mod azure_impl {
             if self.closed {
                 return Err(PyroError::Closed);
             }
-            self.buffer.extend_from_slice(data);
-            eprintln!("[azure_write] data={} buf={} in_flight={}", data.len(), self.buffer.len(), self.in_flight.len());
 
-            while self.buffer.len() >= self.block_size {
-                let remainder = self.buffer.split_off(self.block_size);
-                let block_data = std::mem::replace(&mut self.buffer, remainder);
-                self.spawn_block_upload(block_data)?;
-                eprintln!("[azure_write] staged block, buf={} in_flight={}", self.buffer.len(), self.in_flight.len());
+            let mut remaining = data;
+
+            // Fill any partial buffer from a previous small write.
+            if !self.buffer.is_empty() {
+                let need = self.block_size - self.buffer.len();
+                let take = remaining.len().min(need);
+                self.buffer.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+
+                if self.buffer.len() >= self.block_size {
+                    let block = std::mem::take(&mut self.buffer);
+                    self.spawn_block_upload(block)?;
+                }
+            }
+
+            // Upload full blocks directly from input — no intermediate buffer.
+            while remaining.len() >= self.block_size {
+                let block = remaining[..self.block_size].to_vec();
+                remaining = &remaining[self.block_size..];
+                self.spawn_block_upload(block)?;
+            }
+
+            // Buffer any sub-block-size tail.
+            if !remaining.is_empty() {
+                self.buffer.extend_from_slice(remaining);
             }
 
             Ok(())
         }
 
         fn flush(&mut self) -> Result<()> {
-            let start = std::time::Instant::now();
-            let mut still_running = Vec::new();
-            let mut completed = 0;
-            for handle in self.in_flight.drain(..) {
-                if handle.is_finished() {
-                    self.runtime
-                        .block_on(handle)
-                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
-                    completed += 1;
-                } else {
-                    still_running.push(handle);
-                }
-            }
-            self.in_flight = still_running;
-            eprintln!("[azure_flush] completed={completed} still_running={} elapsed={:?}", self.in_flight.len(), start.elapsed());
-            Ok(())
+            self.drain_completed()
         }
 
         fn close(&mut self) -> Result<()> {
@@ -256,19 +287,13 @@ mod azure_impl {
                 return Ok(());
             }
 
-            eprintln!("[azure_close] starting: buf={} in_flight={} blocks_staged={}", self.buffer.len(), self.in_flight.len(), self.block_ids.len());
-            let start = std::time::Instant::now();
-
             if !self.buffer.is_empty() {
                 let data = std::mem::take(&mut self.buffer);
                 self.spawn_block_upload(data)?;
             }
 
-            let wait_start = std::time::Instant::now();
             self.wait_for_in_flight()?;
-            eprintln!("[azure_close] wait_for_in_flight={:?}", wait_start.elapsed());
 
-            let commit_start = std::time::Instant::now();
             let block_list = BlockLookupList {
                 committed: None,
                 uncommitted: Some(self.block_ids.clone()),
@@ -290,7 +315,6 @@ mod azure_impl {
                             PyroError::Backend(format!("commit_block_list error: {e}"))
                         })
                 })?;
-            eprintln!("[azure_close] commit={:?} total={:?}", commit_start.elapsed(), start.elapsed());
 
             self.closed = true;
             Ok(())

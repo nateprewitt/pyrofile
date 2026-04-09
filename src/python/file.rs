@@ -165,14 +165,8 @@ impl PyPyroFile {
         // so buf_ptr() is valid for len_bytes() bytes.
         let src = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-        let start = std::time::Instant::now();
-        let result = py.allow_threads(|| self.lock_inner()?.write(src))
-            .map_err(|e: PyroError| e.into());
-        let elapsed = start.elapsed();
-        if elapsed.as_millis() > 100 || len > 1_000_000 {
-            eprintln!("[py_write] size={len} elapsed={elapsed:?}");
-        }
-        result
+        py.allow_threads(|| self.lock_inner()?.write(src))
+            .map_err(|e: PyroError| e.into())
     }
 
     #[pyo3(signature = (offset, whence=0))]
