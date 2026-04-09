@@ -20,7 +20,7 @@ pub struct ReadConfig {
     /// Chunk size per HTTP request in parallel downloads. Default: 16 MB.
     pub parallel_chunk_size: usize,
 
-    /// Maximum concurrent download threads. Default: 32.
+    /// Maximum concurrent download workers. Default: 64.
     pub max_read_concurrency: usize,
 }
 
@@ -51,7 +51,7 @@ impl Default for ReadConfig {
             block_size: 16 * 1024 * 1024,         // 16 MB
             max_blocks: 4,                         // 64 MB total
             parallel_chunk_size: 16 * 1024 * 1024, // 16 MB
-            max_read_concurrency: 32,
+            max_read_concurrency: 64,
         }
     }
 }
