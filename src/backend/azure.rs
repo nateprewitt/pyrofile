@@ -146,16 +146,16 @@ mod azure_impl {
                             offset + len as u64 - 1
                         ));
 
+                        let req_start = std::time::Instant::now();
                         let response = client
                             .download(Some(options))
                             .await
                             .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
 
-                        let data: Bytes = response
-                            .into_body()
-                            .collect()
-                            .await
-                            .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
+                        let mut body = response.into_body();
+                        let mut filled = 0usize;
+                        let mut chunk_count = 0u32;
+                        let first_byte = req_start.elapsed();
 
                         // SAFETY: These are distinct slices of the caller's
                         // buffer. block_on waits for all tasks before returning.
@@ -163,10 +163,26 @@ mod azure_impl {
                             std::slice::from_raw_parts_mut(ptr_addr as *mut u8, len)
                         };
 
-                        let n = data.len().min(buf.len());
-                        buf[..n].copy_from_slice(&data[..n]);
+                        while let Some(chunk) = body.next().await {
+                            let chunk = chunk.map_err(|e| {
+                                PyroError::Backend(format!("read body error: {e}"))
+                            })?;
+                            let n = chunk.len().min(buf.len() - filled);
+                            buf[filled..filled + n].copy_from_slice(&chunk[..n]);
+                            filled += n;
+                            chunk_count += 1;
+                            if filled >= buf.len() {
+                                break;
+                            }
+                        }
 
-                        Ok::<usize, PyroError>(n)
+                        let total = req_start.elapsed();
+                        if len > 1_000_000 {
+                            let avg_chunk = if chunk_count > 0 { filled / chunk_count as usize } else { 0 };
+                            eprintln!("[read_range] size={len} ttfb={first_byte:?} total={total:?} chunks={chunk_count} avg_chunk={avg_chunk}");
+                        }
+
+                        Ok::<usize, PyroError>(filled)
                     }));
                 }
 
