@@ -18,6 +18,7 @@ mod azure_impl {
     /// Azure Blob Storage backend.
     pub struct AzureBackend {
         blob_client: Arc<BlobClient>,
+        http_client: reqwest::Client,
         runtime: Arc<Runtime>,
         read_config: crate::core::config::ReadConfig,
         blob_url_str: String,
@@ -53,8 +54,15 @@ mod azure_impl {
             let runtime = Runtime::new()
                 .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))?;
 
+            let http_client = reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .pool_max_idle_per_host(128)
+                .build()
+                .map_err(|e| PyroError::Backend(format!("http client error: {e}")))?;
+
             Ok(Self {
                 blob_client: Arc::new(blob_client),
+                http_client,
                 runtime: Arc::new(runtime),
                 read_config: crate::core::config::ReadConfig::default(),
                 blob_url_str: blob_url.to_string(),
@@ -127,35 +135,37 @@ mod azure_impl {
                 .map(|&(offset, ptr, len)| (offset, ptr as usize, len))
                 .collect();
 
+            let url = self.blob_url_str.clone();
+
             self.block_on_safe(async {
                 let mut handles = Vec::with_capacity(tasks.len());
 
                 for &(offset, ptr_addr, len) in &tasks {
-                    let client = Arc::clone(&self.blob_client);
+                    let client = self.http_client.clone();
                     let sem = Arc::clone(&semaphore);
+                    let url = url.clone();
 
                     handles.push(tokio::spawn(async move {
                         let _permit = sem.acquire().await.map_err(|e| {
                             PyroError::Backend(format!("semaphore error: {e}"))
                         })?;
 
-                        let mut options = BlobClientDownloadOptions::default();
-                        options.range = Some(format!(
-                            "bytes={}-{}",
-                            offset,
-                            offset + len as u64 - 1
-                        ));
-
-                        let req_start = std::time::Instant::now();
                         let response = client
-                            .download(Some(options))
+                            .get(&url)
+                            .header("x-ms-version", "2024-11-04")
+                            .header("Range", format!("bytes={}-{}", offset, offset + len as u64 - 1))
+                            .send()
                             .await
                             .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
 
-                        let mut body = response.into_body();
-                        let mut filled = 0usize;
-                        let mut chunk_count = 0u32;
-                        let first_byte = req_start.elapsed();
+                        if !response.status().is_success() {
+                            return Err(PyroError::Backend(format!(
+                                "HTTP {}: range {}-{}",
+                                response.status(),
+                                offset,
+                                offset + len as u64 - 1,
+                            )));
+                        }
 
                         // SAFETY: These are distinct slices of the caller's
                         // buffer. block_on waits for all tasks before returning.
@@ -163,23 +173,19 @@ mod azure_impl {
                             std::slice::from_raw_parts_mut(ptr_addr as *mut u8, len)
                         };
 
-                        while let Some(chunk) = body.next().await {
+                        let mut filled = 0usize;
+                        let mut stream = response.bytes_stream();
+
+                        while let Some(chunk) = stream.next().await {
                             let chunk = chunk.map_err(|e| {
                                 PyroError::Backend(format!("read body error: {e}"))
                             })?;
                             let n = chunk.len().min(buf.len() - filled);
                             buf[filled..filled + n].copy_from_slice(&chunk[..n]);
                             filled += n;
-                            chunk_count += 1;
                             if filled >= buf.len() {
                                 break;
                             }
-                        }
-
-                        let total = req_start.elapsed();
-                        if len > 1_000_000 {
-                            let avg_chunk = if chunk_count > 0 { filled / chunk_count as usize } else { 0 };
-                            eprintln!("[read_range] size={len} ttfb={first_byte:?} total={total:?} chunks={chunk_count} avg_chunk={avg_chunk}");
                         }
 
                         Ok::<usize, PyroError>(filled)

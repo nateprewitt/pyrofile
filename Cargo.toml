@@ -15,6 +15,7 @@ pyo3 = { version = "0.23", features = ["extension-module"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
 futures = { version = "0.3", optional = true }
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false, optional = true }
 azure_storage_blob = { version = "0.10", optional = true }
 azure_identity = { version = "0.33", optional = true }
 azure_core = { version = "0.33", optional = true }
@@ -24,7 +25,7 @@ url = { version = "2", optional = true }
 
 [features]
 default = []
-azure = ["dep:tokio", "dep:futures", "dep:azure_storage_blob", "dep:azure_identity", "dep:azure_core", "dep:uuid", "dep:base64", "dep:url", "dep:openssl-sys"]
+azure = ["dep:tokio", "dep:futures", "dep:reqwest", "dep:azure_storage_blob", "dep:azure_identity", "dep:azure_core", "dep:uuid", "dep:base64", "dep:url", "dep:openssl-sys"]
 
 [dependencies.openssl-sys]
 version = "0.9"
