@@ -17,7 +17,7 @@ mod azure_impl {
 
     /// Azure Blob Storage backend.
     pub struct AzureBackend {
-        blob_client: BlobClient,
+        blob_client: Arc<BlobClient>,
         runtime: Arc<Runtime>,
         blob_url_str: String,
     }
@@ -53,7 +53,7 @@ mod azure_impl {
                 .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))?;
 
             Ok(Self {
-                blob_client,
+                blob_client: Arc::new(blob_client),
                 runtime: Arc::new(runtime),
                 blob_url_str: blob_url.to_string(),
             })
@@ -109,6 +109,74 @@ mod azure_impl {
                 return Ok(0);
             }
             self.download_into(offset, buf)
+        }
+
+        fn read_ranges(&self, ranges: &[(u64, *mut u8, usize)]) -> Result<Vec<usize>> {
+            if ranges.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let tasks: Vec<(u64, usize, usize)> = ranges
+                .iter()
+                .map(|&(offset, ptr, len)| (offset, ptr as usize, len))
+                .collect();
+
+            self.block_on_safe(async {
+                let mut handles = Vec::with_capacity(tasks.len());
+
+                for &(offset, ptr_addr, len) in &tasks {
+                    let client = Arc::clone(&self.blob_client);
+
+                    handles.push(tokio::spawn(async move {
+                        let mut options = BlobClientDownloadOptions::default();
+                        options.range = Some(format!(
+                            "bytes={}-{}",
+                            offset,
+                            offset + len as u64 - 1
+                        ));
+
+                        let response = client
+                            .download(Some(options))
+                            .await
+                            .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
+
+                        let mut body = response.into_body();
+                        let mut filled = 0usize;
+
+                        // SAFETY: These are distinct slices of the caller's
+                        // buffer. block_on waits for all tasks before returning.
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(ptr_addr as *mut u8, len)
+                        };
+
+                        while let Some(chunk) = body.next().await {
+                            let chunk = chunk.map_err(|e| {
+                                PyroError::Backend(format!("read body error: {e}"))
+                            })?;
+                            let n = chunk.len().min(buf.len() - filled);
+                            buf[filled..filled + n].copy_from_slice(&chunk[..n]);
+                            filled += n;
+                            if filled >= buf.len() {
+                                break;
+                            }
+                        }
+
+                        Ok::<usize, PyroError>(filled)
+                    }));
+                }
+
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    results.push(
+                        handle
+                            .await
+                            .map_err(|e| PyroError::Backend(format!("task join error: {e}")))?,
+                    );
+                }
+                Ok::<Vec<Result<usize>>, PyroError>(results)
+            })?
+            .into_iter()
+            .collect()
         }
 
         fn metadata(&self) -> Result<ObjectMeta> {

@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{PyroError, Result};
 
 /// Metadata about a storage object.
 #[derive(Debug, Clone)]
@@ -43,6 +43,21 @@ pub trait StorageBackend: Send + Sync {
         let n = self.read_at(offset, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    /// Read multiple ranges concurrently, writing directly into the
+    /// provided buffer pointers.
+    ///
+    /// # Safety
+    /// Each (ptr, len) must point to a valid, writable region that does not
+    /// overlap another range and remains live for the duration of this call.
+    fn read_ranges(&self, ranges: &[(u64, *mut u8, usize)]) -> Result<Vec<usize>> {
+        let mut results = Vec::with_capacity(ranges.len());
+        for &(offset, ptr, len) in ranges {
+            let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            results.push(self.read_at(offset, buf)?);
+        }
+        Ok(results)
     }
 }
 

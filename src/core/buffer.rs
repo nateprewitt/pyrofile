@@ -88,7 +88,7 @@ impl BlockCache {
         Ok(filled)
     }
 
-    /// Download into `dest` using concurrent workers.
+    /// Download into `dest` using the backend's concurrent read support.
     fn parallel_read(
         cursor: u64,
         dest: &mut [u8],
@@ -111,69 +111,22 @@ impl BlockCache {
         let per_worker = total_len.div_ceil(num_workers);
         let effective_chunk = per_worker.min(max_chunk_size);
 
-        let first_err: std::sync::Mutex<Option<PyroError>> = std::sync::Mutex::new(None);
-        let worker_results: std::sync::Mutex<Vec<(usize, usize)>> =
-            std::sync::Mutex::new(Vec::with_capacity(num_workers));
+        let mut ranges: Vec<(u64, *mut u8, usize)> = Vec::new();
+        let mut offset = cursor;
+        let mut buf_offset = 0usize;
 
-        std::thread::scope(|s| {
-            let mut remaining = &mut *dest;
-            let mut offset = cursor;
-            let mut worker_idx = 0;
-
-            while !remaining.is_empty() {
-                let this_len = remaining.len().min(per_worker);
-                let (this_slice, rest) = remaining.split_at_mut(this_len);
-                remaining = rest;
-                let this_offset = offset;
-                let this_worker = worker_idx;
-                offset += this_len as u64;
-                worker_idx += 1;
-
-                let err_ref = &first_err;
-                let results_ref = &worker_results;
-
-                s.spawn(move || {
-                    let mut filled = 0;
-                    let mut pos = this_offset;
-
-                    while filled < this_slice.len() {
-                        if err_ref.lock().unwrap().is_some() {
-                            return;
-                        }
-
-                        let read_len = (this_slice.len() - filled).min(effective_chunk);
-                        match backend.read_at(pos, &mut this_slice[filled..filled + read_len]) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                filled += n;
-                                pos += n as u64;
-                            }
-                            Err(e) => {
-                                let mut guard = err_ref.lock().unwrap();
-                                if guard.is_none() {
-                                    *guard = Some(e);
-                                }
-                                return;
-                            }
-                        }
-                    }
-
-                    results_ref
-                        .lock()
-                        .unwrap()
-                        .push((this_worker, filled));
-                });
-            }
-        });
-
-        if let Some(e) = first_err.into_inner().unwrap() {
-            return Err(e);
+        while buf_offset < total_len {
+            let chunk_len = (total_len - buf_offset).min(effective_chunk);
+            // SAFETY: ptr points to a distinct slice of dest,
+            // and read_ranges blocks until all work completes.
+            let ptr = unsafe { dest.as_mut_ptr().add(buf_offset) };
+            ranges.push((offset, ptr, chunk_len));
+            offset += chunk_len as u64;
+            buf_offset += chunk_len;
         }
 
-        let mut results = worker_results.into_inner().unwrap();
-        results.sort_by_key(|(idx, _)| *idx);
-        let total_filled: usize = results.iter().map(|(_, n)| n).sum();
-        Ok(total_filled)
+        let results = backend.read_ranges(&ranges)?;
+        Ok(results.iter().sum())
     }
 
     /// Look up or fetch the block starting at `block_start`.
