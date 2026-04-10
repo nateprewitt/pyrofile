@@ -151,8 +151,11 @@ mod azure_impl {
                             .await
                             .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
 
-                        let mut body = response.into_body();
-                        let mut filled = 0usize;
+                        let data: Bytes = response
+                            .into_body()
+                            .collect()
+                            .await
+                            .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
 
                         // SAFETY: These are distinct slices of the caller's
                         // buffer. block_on waits for all tasks before returning.
@@ -160,19 +163,10 @@ mod azure_impl {
                             std::slice::from_raw_parts_mut(ptr_addr as *mut u8, len)
                         };
 
-                        while let Some(chunk) = body.next().await {
-                            let chunk = chunk.map_err(|e| {
-                                PyroError::Backend(format!("read body error: {e}"))
-                            })?;
-                            let n = chunk.len().min(buf.len() - filled);
-                            buf[filled..filled + n].copy_from_slice(&chunk[..n]);
-                            filled += n;
-                            if filled >= buf.len() {
-                                break;
-                            }
-                        }
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
 
-                        Ok::<usize, PyroError>(filled)
+                        Ok::<usize, PyroError>(n)
                     }));
                 }
 
