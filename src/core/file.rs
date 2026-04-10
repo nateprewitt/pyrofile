@@ -417,6 +417,7 @@ mod tests {
             },
             write_config: crate::core::config::WriteConfig {
                 part_size: 8 * 1024 * 1024,
+                max_concurrent_uploads: 64,
                 put_max: 5 * 1024 * 1024 * 1024,
             },
         };

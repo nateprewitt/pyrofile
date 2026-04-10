@@ -23,8 +23,6 @@ mod azure_impl {
     }
 
     impl AzureBackend {
-        const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
-        const MAX_CONCURRENT_UPLOADS: usize = 64;
 
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
@@ -134,13 +132,14 @@ mod azure_impl {
 
         fn create_writer(&self) -> Result<Box<dyn ObjectWriter>> {
             let block_blob_client = self.blob_client.block_blob_client();
+            let config = crate::core::config::WriteConfig::default();
             Ok(Box::new(AzureWriter {
                 block_blob_client: Arc::new(block_blob_client),
                 runtime: Arc::clone(&self.runtime),
                 buffer: Vec::new(),
                 block_ids: Vec::new(),
                 in_flight: Vec::new(),
-                block_size: Self::BLOCK_SIZE,
+                config,
                 closed: false,
             }))
         }
@@ -157,17 +156,16 @@ mod azure_impl {
         buffer: Vec<u8>,
         block_ids: Vec<Vec<u8>>,
         in_flight: Vec<JoinHandle<Result<()>>>,
-        block_size: usize,
+        config: crate::core::config::WriteConfig,
         closed: bool,
     }
 
     impl AzureWriter {
         fn spawn_block_upload(&mut self, data: Vec<u8>) -> Result<()> {
-            if self.in_flight.len() >= AzureBackend::MAX_CONCURRENT_UPLOADS {
+            if self.in_flight.len() >= self.config.max_concurrent_uploads {
                 self.drain_completed()?;
             }
-            // If still at the cap after draining, wait for one to finish.
-            if self.in_flight.len() >= AzureBackend::MAX_CONCURRENT_UPLOADS {
+            if self.in_flight.len() >= self.config.max_concurrent_uploads {
                 self.wait_for_one()?;
             }
 
@@ -252,21 +250,21 @@ mod azure_impl {
 
             // Fill any partial buffer from a previous small write.
             if !self.buffer.is_empty() {
-                let need = self.block_size - self.buffer.len();
+                let need = self.config.part_size - self.buffer.len();
                 let take = remaining.len().min(need);
                 self.buffer.extend_from_slice(&remaining[..take]);
                 remaining = &remaining[take..];
 
-                if self.buffer.len() >= self.block_size {
+                if self.buffer.len() >= self.config.part_size {
                     let block = std::mem::take(&mut self.buffer);
                     self.spawn_block_upload(block)?;
                 }
             }
 
             // Upload full blocks directly from input — no intermediate buffer.
-            while remaining.len() >= self.block_size {
-                let block = remaining[..self.block_size].to_vec();
-                remaining = &remaining[self.block_size..];
+            while remaining.len() >= self.config.part_size {
+                let block = remaining[..self.config.part_size].to_vec();
+                remaining = &remaining[self.config.part_size..];
                 self.spawn_block_upload(block)?;
             }
 

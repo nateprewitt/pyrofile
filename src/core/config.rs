@@ -1,3 +1,25 @@
+/// Parse a size value from environment variables.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| parse_size(&v))
+        .unwrap_or(default)
+}
+
+fn parse_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let (num, multiplier) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+        (n.trim(), 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+        (n.trim(), 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+        (n.trim(), 1024)
+    } else {
+        (s, 1)
+    };
+    num.parse::<usize>().ok().map(|n| n * multiplier)
+}
+
 /// Configuration for [`PyroIO`](super::file::PyroIO).
 #[derive(Debug, Clone)]
 pub struct PyroIOConfig {
@@ -27,12 +49,14 @@ pub struct ReadConfig {
 /// Configuration for write operations (passed to SmartWriter).
 #[derive(Debug, Clone)]
 pub struct WriteConfig {
-    /// Part size for multipart uploads in bytes. Default: 8 MB.
+    /// Part size for multipart uploads in bytes. Default: 16 MB.
     pub part_size: usize,
 
+    /// Maximum concurrent upload tasks. Default: 64.
+    pub max_concurrent_uploads: usize,
+
     /// Maximum data size for a single PUT upload in bytes. Above this,
-    /// multipart is used. Should reflect the provider's single-object PUT
-    /// limit (e.g., 5 GB for most cloud providers). Default: 5 GB.
+    /// multipart is used. Default: 5 GB.
     pub put_max: u64,
 }
 
@@ -48,10 +72,10 @@ impl Default for PyroIOConfig {
 impl Default for ReadConfig {
     fn default() -> Self {
         Self {
-            block_size: 16 * 1024 * 1024,         // 16 MB
-            max_blocks: 4,                         // 64 MB total
-            parallel_chunk_size: 16 * 1024 * 1024, // 16 MB
-            max_read_concurrency: 64,
+            block_size: env_usize("PYROFILE_CACHE_BLOCK_SIZE", 16 * 1024 * 1024),
+            max_blocks: env_usize("PYROFILE_CACHE_BLOCKS", 4),
+            parallel_chunk_size: env_usize("PYROFILE_READ_CHUNK_SIZE", 16 * 1024 * 1024),
+            max_read_concurrency: env_usize("PYROFILE_READ_CONCURRENCY", 64),
         }
     }
 }
@@ -59,8 +83,9 @@ impl Default for ReadConfig {
 impl Default for WriteConfig {
     fn default() -> Self {
         Self {
-            part_size: 8 * 1024 * 1024,              // 8 MB
-            put_max: 5 * 1024 * 1024 * 1024_u64,      // 5 GB
+            part_size: env_usize("PYROFILE_WRITE_BLOCK_SIZE", 16 * 1024 * 1024),
+            max_concurrent_uploads: env_usize("PYROFILE_WRITE_CONCURRENCY", 64),
+            put_max: 5 * 1024 * 1024 * 1024_u64,
         }
     }
 }
