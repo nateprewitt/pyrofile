@@ -19,6 +19,7 @@ mod azure_impl {
     pub struct AzureBackend {
         blob_client: Arc<BlobClient>,
         runtime: Arc<Runtime>,
+        read_config: crate::core::config::ReadConfig,
         blob_url_str: String,
     }
 
@@ -55,6 +56,7 @@ mod azure_impl {
             Ok(Self {
                 blob_client: Arc::new(blob_client),
                 runtime: Arc::new(runtime),
+                read_config: crate::core::config::ReadConfig::default(),
                 blob_url_str: blob_url.to_string(),
             })
         }
@@ -116,6 +118,10 @@ mod azure_impl {
                 return Ok(Vec::new());
             }
 
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                self.read_config.max_read_concurrency,
+            ));
+
             let tasks: Vec<(u64, usize, usize)> = ranges
                 .iter()
                 .map(|&(offset, ptr, len)| (offset, ptr as usize, len))
@@ -126,8 +132,13 @@ mod azure_impl {
 
                 for &(offset, ptr_addr, len) in &tasks {
                     let client = Arc::clone(&self.blob_client);
+                    let sem = Arc::clone(&semaphore);
 
                     handles.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await.map_err(|e| {
+                            PyroError::Backend(format!("semaphore error: {e}"))
+                        })?;
+
                         let mut options = BlobClientDownloadOptions::default();
                         options.range = Some(format!(
                             "bytes={}-{}",
