@@ -205,7 +205,7 @@ impl PyroIO {
     }
 
     /// Get the file size, fetching from metadata if not yet cached.
-    fn get_size(&mut self) -> Result<u64> {
+    pub fn get_size(&mut self) -> Result<u64> {
         if let Some(s) = self.size {
             return Ok(s);
         }

@@ -116,8 +116,36 @@ impl PyPyroFile {
     #[pyo3(signature = (size=None))]
     fn read<'py>(&self, py: Python<'py>, size: Option<i64>) -> PyResult<Bound<'py, PyBytes>> {
         let size = size.unwrap_or(-1);
-        let bytes = py.allow_threads(|| self.lock_inner()?.read(size))?;
-        Ok(PyBytes::new(py, &bytes))
+
+        if size >= 0 {
+            let len = size as usize;
+            return PyBytes::new_with(py, len, |buf| {
+                let filled = py.allow_threads(|| self.lock_inner()?.read_into(buf))?;
+                // Zero any unfilled tail (read_into may return less at EOF)
+                buf[filled..].fill(0);
+                Ok(())
+            });
+        }
+
+        // read(-1): need file size first to allocate
+        let file_size = py.allow_threads(|| {
+            let mut inner = self.lock_inner()?;
+            let size = inner.get_size()?;
+            let cursor = inner.tell();
+            Ok::<(u64, u64), PyroError>((size, cursor))
+        })?;
+
+        let (total_size, cursor) = file_size;
+        if cursor >= total_size {
+            return Ok(PyBytes::new(py, &[]));
+        }
+
+        let remaining = (total_size - cursor) as usize;
+        PyBytes::new_with(py, remaining, |buf| {
+            let filled = py.allow_threads(|| self.lock_inner()?.read_into(buf))?;
+            buf[filled..].fill(0);
+            Ok(())
+        })
     }
 
     fn readinto(&self, py: Python<'_>, buffer: PyBuffer<u8>) -> PyResult<usize> {
