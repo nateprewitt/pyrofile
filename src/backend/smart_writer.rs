@@ -236,7 +236,7 @@ mod tests {
     }
 
     fn small_config() -> WriteConfig {
-        WriteConfig { part_size: 10, put_max: 25 }
+        WriteConfig { part_size: 10, max_concurrent_uploads: 64, put_max: 25 }
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn write_at_put_max_uses_put_object() {
         // part_size larger than data so nothing flushes during write().
-        let config = WriteConfig { part_size: 100, put_max: 25 };
+        let config = WriteConfig { part_size: 100, max_concurrent_uploads: 64, put_max: 25 };
         let prims = MockPrimitives::new();
         let mut w = SmartWriter::new(prims, config);
         w.write(&vec![0u8; 25]).unwrap();
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn buffered_data_exceeding_put_max_uses_multipart_on_close() {
-        let config = WriteConfig { part_size: 20, put_max: 10 };
+        let config = WriteConfig { part_size: 20, max_concurrent_uploads: 64, put_max: 10 };
         let prims = MockPrimitives::new();
         let mut w = SmartWriter::new(prims, config);
         w.write(&vec![0u8; 15]).unwrap();

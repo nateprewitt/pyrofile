@@ -205,7 +205,7 @@ impl PyroIO {
     }
 
     /// Get the file size, fetching from metadata if not yet cached.
-    fn get_size(&mut self) -> Result<u64> {
+    pub fn get_size(&mut self) -> Result<u64> {
         if let Some(s) = self.size {
             return Ok(s);
         }
@@ -417,6 +417,7 @@ mod tests {
             },
             write_config: crate::core::config::WriteConfig {
                 part_size: 8 * 1024 * 1024,
+                max_concurrent_uploads: 64,
                 put_max: 5 * 1024 * 1024 * 1024,
             },
         };
