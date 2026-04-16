@@ -132,7 +132,7 @@ mod azure_impl {
                     let buf_pos = dest_offset;
                     dest_offset += len;
 
-                    futs.push(async move {
+                    futs.push(tokio::spawn(async move {
                         let _permit = sem.acquire().await.map_err(|e| {
                             PyroError::Backend(format!("semaphore error: {e}"))
                         })?;
@@ -156,12 +156,13 @@ mod azure_impl {
                             .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
 
                         Ok::<(usize, Bytes), PyroError>((buf_pos, data))
-                    });
+                    }));
                 }
 
                 let mut filled = 0usize;
                 while let Some(result) = futures::StreamExt::next(&mut futs).await {
-                    let (buf_pos, data) = result?;
+                    let (buf_pos, data) = result
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
                     let n = data.len().min(dest.len() - buf_pos);
                     dest[buf_pos..buf_pos + n].copy_from_slice(&data[..n]);
                     filled += n;
