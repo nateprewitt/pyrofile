@@ -44,6 +44,17 @@ pub trait StorageBackend: Send + Sync {
         buf.truncate(n);
         Ok(buf)
     }
+
+    /// Download multiple ranges (concurrency determined by backend)
+    fn read_ranges(&self, ranges: &[(u64, usize)], dest: &mut [u8]) -> Result<usize> {
+        let mut filled = 0;
+        for &(offset, len) in ranges {
+            let end = (filled + len).min(dest.len());
+            let n = self.read_at(offset, &mut dest[filled..end])?;
+            filled += n;
+        }
+        Ok(filled)
+    }
 }
 
 /// Write interface for storage backends.

@@ -10,7 +10,6 @@ mod azure_impl {
     use azure_storage_blob::{BlobClient, BlobClientOptions, BlockBlobClient};
     use futures::StreamExt;
     use tokio::runtime::Runtime;
-    use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
 
     use crate::backend::traits::{ObjectMeta, ObjectWriter, StorageBackend};
@@ -18,14 +17,12 @@ mod azure_impl {
 
     /// Azure Blob Storage backend.
     pub struct AzureBackend {
-        blob_client: BlobClient,
+        blob_client: Arc<BlobClient>,
         runtime: Arc<Runtime>,
         blob_url_str: String,
     }
 
     impl AzureBackend {
-        const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
-        const MAX_CONCURRENT_UPLOADS: usize = 64;
 
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
@@ -56,7 +53,7 @@ mod azure_impl {
                 .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))?;
 
             Ok(Self {
-                blob_client,
+                blob_client: Arc::new(blob_client),
                 runtime: Arc::new(runtime),
                 blob_url_str: blob_url.to_string(),
             })
@@ -114,6 +111,65 @@ mod azure_impl {
             self.download_into(offset, buf)
         }
 
+        fn read_ranges(&self, ranges: &[(u64, usize)], dest: &mut [u8]) -> Result<usize> {
+            if ranges.is_empty() {
+                return Ok(0);
+            }
+
+            let read_config = crate::core::config::ReadConfig::default();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                read_config.max_read_concurrency,
+            ));
+
+            let mut dest_offset = 0usize;
+
+            self.block_on_safe(async {
+                let mut futs = futures::stream::FuturesUnordered::new();
+
+                for &(file_offset, len) in ranges {
+                    let client = Arc::clone(&self.blob_client);
+                    let sem = Arc::clone(&semaphore);
+                    let buf_pos = dest_offset;
+                    dest_offset += len;
+
+                    futs.push(async move {
+                        let _permit = sem.acquire().await.map_err(|e| {
+                            PyroError::Backend(format!("semaphore error: {e}"))
+                        })?;
+
+                        let mut options = BlobClientDownloadOptions::default();
+                        options.range = Some(format!(
+                            "bytes={}-{}",
+                            file_offset,
+                            file_offset + len as u64 - 1,
+                        ));
+
+                        let response = client
+                            .download(Some(options))
+                            .await
+                            .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
+
+                        let data: Bytes = response
+                            .into_body()
+                            .collect()
+                            .await
+                            .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
+
+                        Ok::<(usize, Bytes), PyroError>((buf_pos, data))
+                    });
+                }
+
+                let mut filled = 0usize;
+                while let Some(result) = futures::StreamExt::next(&mut futs).await {
+                    let (buf_pos, data) = result?;
+                    let n = data.len().min(dest.len() - buf_pos);
+                    dest[buf_pos..buf_pos + n].copy_from_slice(&data[..n]);
+                    filled += n;
+                }
+                Ok::<usize, PyroError>(filled)
+            })
+        }
+
         fn metadata(&self) -> Result<ObjectMeta> {
             use azure_storage_blob::models::BlobClientGetPropertiesResultHeaders;
             let props = self.block_on_safe(async {
@@ -135,14 +191,14 @@ mod azure_impl {
 
         fn create_writer(&self) -> Result<Box<dyn ObjectWriter>> {
             let block_blob_client = self.blob_client.block_blob_client();
+            let config = crate::core::config::WriteConfig::default();
             Ok(Box::new(AzureWriter {
                 block_blob_client: Arc::new(block_blob_client),
                 runtime: Arc::clone(&self.runtime),
                 buffer: Vec::new(),
                 block_ids: Vec::new(),
                 in_flight: Vec::new(),
-                semaphore: Arc::new(Semaphore::new(Self::MAX_CONCURRENT_UPLOADS)),
-                block_size: Self::BLOCK_SIZE,
+                config,
                 closed: false,
             }))
         }
@@ -159,26 +215,27 @@ mod azure_impl {
         buffer: Vec<u8>,
         block_ids: Vec<Vec<u8>>,
         in_flight: Vec<JoinHandle<Result<()>>>,
-        semaphore: Arc<Semaphore>,
-        block_size: usize,
+        config: crate::core::config::WriteConfig,
         closed: bool,
     }
 
     impl AzureWriter {
         fn spawn_block_upload(&mut self, data: Vec<u8>) -> Result<()> {
+            // Apply backpressure: don't spawn if at concurrency cap.
+            if self.in_flight.len() >= self.config.max_concurrent_uploads {
+                self.drain_completed()?;
+            }
+            if self.in_flight.len() >= self.config.max_concurrent_uploads {
+                self.wait_for_one()?;
+            }
+
             let block_id = uuid::Uuid::new_v4().to_string().into_bytes();
             self.block_ids.push(block_id.clone());
 
             let client = Arc::clone(&self.block_blob_client);
-            let semaphore = Arc::clone(&self.semaphore);
             let content_length = data.len() as u64;
 
             let handle = self.runtime.spawn(async move {
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| PyroError::Backend(format!("semaphore error: {e}")))?;
-
                 let body: RequestContent<Bytes, NoFormat> = Bytes::from(data).into();
 
                 client
@@ -195,6 +252,32 @@ mod azure_impl {
             });
 
             self.in_flight.push(handle);
+            Ok(())
+        }
+
+        fn drain_completed(&mut self) -> Result<()> {
+            let mut still_running = Vec::new();
+            for handle in self.in_flight.drain(..) {
+                if handle.is_finished() {
+                    self.runtime
+                        .block_on(handle)
+                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
+                } else {
+                    still_running.push(handle);
+                }
+            }
+            self.in_flight = still_running;
+            Ok(())
+        }
+
+        fn wait_for_one(&mut self) -> Result<()> {
+            if self.in_flight.is_empty() {
+                return Ok(());
+            }
+            let handle = self.in_flight.remove(0);
+            self.runtime
+                .block_on(handle)
+                .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
             Ok(())
         }
 
@@ -219,31 +302,39 @@ mod azure_impl {
             if self.closed {
                 return Err(PyroError::Closed);
             }
-            self.buffer.extend_from_slice(data);
 
-            while self.buffer.len() >= self.block_size {
-                let remainder = self.buffer.split_off(self.block_size);
-                let block_data = std::mem::replace(&mut self.buffer, remainder);
-                self.spawn_block_upload(block_data)?;
+            let mut remaining = data;
+
+            // Fill any partial buffer from a previous small write.
+            if !self.buffer.is_empty() {
+                let need = self.config.part_size - self.buffer.len();
+                let take = remaining.len().min(need);
+                self.buffer.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+
+                if self.buffer.len() >= self.config.part_size {
+                    let block = std::mem::take(&mut self.buffer);
+                    self.spawn_block_upload(block)?;
+                }
+            }
+
+            // Upload full blocks directly from input.
+            while remaining.len() >= self.config.part_size {
+                let block = remaining[..self.config.part_size].to_vec();
+                remaining = &remaining[self.config.part_size..];
+                self.spawn_block_upload(block)?;
+            }
+
+            // Buffer any sub-block-size tail.
+            if !remaining.is_empty() {
+                self.buffer.extend_from_slice(remaining);
             }
 
             Ok(())
         }
 
         fn flush(&mut self) -> Result<()> {
-            // Surface errors from finished transfers early.
-            let mut still_running = Vec::new();
-            for handle in self.in_flight.drain(..) {
-                if handle.is_finished() {
-                    self.runtime
-                        .block_on(handle)
-                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
-                } else {
-                    still_running.push(handle);
-                }
-            }
-            self.in_flight = still_running;
-            Ok(())
+            self.drain_completed()
         }
 
         fn close(&mut self) -> Result<()> {
