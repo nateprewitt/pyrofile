@@ -117,21 +117,17 @@ impl PyPyroFile {
     fn read<'py>(&self, py: Python<'py>, size: Option<i64>) -> PyResult<Bound<'py, PyBytes>> {
         let size = size.unwrap_or(-1);
 
-        if size >= 0 {
-            let len = size as usize;
-            return PyBytes::new_with(py, len, |buf| {
-                let filled = py.allow_threads(|| self.lock_inner()?.read_into(buf))?;
-                buf[filled..].fill(0);
-                Ok(())
-            });
+        if size == 0 {
+            return Ok(PyBytes::new(py, &[]));
         }
 
-        // read(-1): need file size to allocate
+        // Clamp allocation to bytes remaining so read() never returns more than
+        // the data available (negative size means read all remaining).
         let (total_size, cursor) = py.allow_threads(|| {
             let mut inner = self.lock_inner()?;
-            let size = inner.get_size()?;
+            let total = inner.get_size()?;
             let cursor = inner.tell();
-            Ok::<(u64, u64), PyroError>((size, cursor))
+            Ok::<(u64, u64), PyroError>((total, cursor))
         })?;
 
         if cursor >= total_size {
@@ -139,7 +135,13 @@ impl PyPyroFile {
         }
 
         let remaining = (total_size - cursor) as usize;
-        PyBytes::new_with(py, remaining, |buf| {
+        let to_read = if size < 0 {
+            remaining
+        } else {
+            (size as usize).min(remaining)
+        };
+
+        PyBytes::new_with(py, to_read, |buf| {
             let filled = py.allow_threads(|| self.lock_inner()?.read_into(buf))?;
             buf[filled..].fill(0);
             Ok(())

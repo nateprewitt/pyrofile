@@ -23,7 +23,6 @@ mod azure_impl {
     }
 
     impl AzureBackend {
-
         /// Create a new AzureBackend from a full blob URL.
         /// Uses DeveloperToolsCredential for authentication.
         /// If the URL contains a SAS token, pass `None` as credential.
@@ -111,15 +110,12 @@ mod azure_impl {
             self.download_into(offset, buf)
         }
 
-        fn read_ranges(&self, ranges: &[(u64, usize)], dest: &mut [u8]) -> Result<usize> {
+        fn read_ranges(&self, ranges: &[(u64, usize)], dest: &mut [u8], max_concurrency: usize) -> Result<usize> {
             if ranges.is_empty() {
                 return Ok(0);
             }
 
-            let read_config = crate::core::config::ReadConfig::default();
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(
-                read_config.max_read_concurrency,
-            ));
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
 
             let mut dest_offset = 0usize;
 

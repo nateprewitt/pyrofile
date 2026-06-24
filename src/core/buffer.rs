@@ -1,6 +1,6 @@
 use crate::backend::traits::StorageBackend;
 use crate::core::config::ReadConfig;
-use crate::error::{PyroError, Result};
+use crate::error::Result;
 
 /// A single cached block of file data.
 struct Block {
@@ -122,7 +122,7 @@ impl BlockCache {
             remaining -= chunk_len;
         }
 
-        let filled = backend.read_ranges(&ranges, dest)?;
+        let filled = backend.read_ranges(&ranges, dest, max_concurrency)?;
         Ok(filled)
     }
 
