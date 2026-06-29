@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
 futures = { version = "0.3", optional = true }
 azure_storage_blob = { version = "0.10", optional = true }
 azure_identity = { version = "0.33", optional = true }

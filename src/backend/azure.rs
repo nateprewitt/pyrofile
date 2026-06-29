@@ -1,6 +1,6 @@
 #[cfg(feature = "azure")]
 mod azure_impl {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use azure_core::http::{NoFormat, RequestContent, XmlFormat};
     use azure_core::Bytes;
@@ -15,6 +15,111 @@ mod azure_impl {
     use crate::backend::traits::{ObjectMeta, ObjectWriter, StorageBackend};
     use crate::error::{PyroError, Result};
 
+    type SharedCredential = Arc<dyn azure_core::credentials::TokenCredential>;
+
+    const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
+    const CREDENTIAL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Process-wide tokio runtime + Azure credential.
+    struct SharedAzure {
+        pid: u32,
+        runtime: Arc<Runtime>,
+        credential: Option<SharedCredential>,
+    }
+
+    static SHARED_AZURE: Mutex<Option<SharedAzure>> = Mutex::new(None);
+
+    fn build_runtime() -> Result<Arc<Runtime>> {
+        Runtime::new()
+            .map(Arc::new)
+            .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))
+    }
+
+    /// Choose a credential for the current host, preferring the following:
+    ///   1. Environment service principal
+    ///   2. AKS workload identity
+    ///   3. Managed identity
+    ///   4. Developer tools
+    fn select_credential(runtime: &Runtime) -> Result<SharedCredential> {
+        use azure_core::credentials::TokenCredential;
+
+        // Environment variables
+        if let (Ok(tenant_id), Ok(client_id), Ok(secret)) = (
+            std::env::var("AZURE_TENANT_ID"),
+            std::env::var("AZURE_CLIENT_ID"),
+            std::env::var("AZURE_CLIENT_SECRET"),
+        ) {
+            if let Ok(cred) = azure_identity::ClientSecretCredential::new(
+                &tenant_id,
+                client_id,
+                secret.into(),
+                None,
+            ) {
+                let cred: SharedCredential = cred;
+                return Ok(cred);
+            }
+        }
+
+        // AKS workload identity
+        if std::env::var_os("AZURE_FEDERATED_TOKEN_FILE").is_some() {
+            if let Ok(cred) = azure_identity::WorkloadIdentityCredential::new(None) {
+                let cred: SharedCredential = cred;
+                return Ok(cred);
+            }
+        }
+
+        // Managed identity
+        if let Ok(managed) = azure_identity::ManagedIdentityCredential::new(None) {
+            let usable = runtime.block_on(async {
+                tokio::time::timeout(
+                    CREDENTIAL_PROBE_TIMEOUT,
+                    managed.get_token(&[STORAGE_SCOPE], None),
+                )
+                .await
+                .map(|inner| inner.is_ok())
+                .unwrap_or(false)
+            });
+            if usable {
+                let cred: SharedCredential = managed;
+                return Ok(cred);
+            }
+        }
+
+        // Developer tools
+        let cred: SharedCredential = azure_identity::DeveloperToolsCredential::new(None)
+            .map_err(|e| PyroError::Backend(format!("credential error: {e}")))?;
+        Ok(cred)
+    }
+
+    /// Return the process-wide runtime and, when `need_credential` is set, the
+    /// shared credential.
+    fn shared_azure(need_credential: bool) -> Result<(Arc<Runtime>, Option<SharedCredential>)> {
+        let mut guard = SHARED_AZURE
+            .lock()
+            .map_err(|e| PyroError::Backend(format!("shared azure lock poisoned: {e}")))?;
+
+        let pid = std::process::id();
+        let forked = guard.as_ref().map_or(true, |shared| shared.pid != pid);
+        if forked {
+            if let Some(stale) = guard.take() {
+                // Inherited from a parent process across fork(): leak, don't drop.
+                std::mem::forget(stale);
+            }
+            *guard = Some(SharedAzure {
+                pid,
+                runtime: build_runtime()?,
+                credential: None,
+            });
+        }
+
+        let shared = guard.as_mut().expect("shared azure built above");
+        if need_credential && shared.credential.is_none() {
+            shared.credential = Some(select_credential(&shared.runtime)?);
+        }
+
+        Ok((Arc::clone(&shared.runtime), shared.credential.clone()))
+    }
+
     /// Azure Blob Storage backend.
     pub struct AzureBackend {
         blob_client: Arc<BlobClient>,
@@ -24,22 +129,15 @@ mod azure_impl {
 
     impl AzureBackend {
         /// Create a new AzureBackend from a full blob URL.
-        /// Uses DeveloperToolsCredential for authentication.
-        /// If the URL contains a SAS token, pass `None` as credential.
         pub fn new(blob_url: &str) -> Result<Self> {
             let parsed_url = url::Url::parse(blob_url)
                 .map_err(|e| PyroError::InvalidArgument(format!("invalid URL: {e}")))?;
 
-            // If URL has a SAS token (sig= in query), use anonymous auth.
-            // Otherwise, use DeveloperToolsCredential.
-            let credential: Option<Arc<dyn azure_core::credentials::TokenCredential>> =
-                if parsed_url.query().map_or(false, |q| q.contains("sig=")) {
-                    None
-                } else {
-                    let cred = azure_identity::DeveloperToolsCredential::new(None)
-                        .map_err(|e| PyroError::Backend(format!("credential error: {e}")))?;
-                    Some(cred)
-                };
+            // A SAS token (sig= in query) authenticates anonymously, so we don't
+            // need (or want to build) a credential for it.
+            let is_sas = parsed_url.query().map_or(false, |q| q.contains("sig="));
+            let (runtime, shared_credential) = shared_azure(!is_sas)?;
+            let credential: Option<SharedCredential> = if is_sas { None } else { shared_credential };
 
             let blob_client = BlobClient::from_url(
                 parsed_url.clone(),
@@ -48,12 +146,9 @@ mod azure_impl {
             )
             .map_err(|e| PyroError::Backend(format!("client error: {e}")))?;
 
-            let runtime = Runtime::new()
-                .map_err(|e| PyroError::Backend(format!("tokio runtime error: {e}")))?;
-
             Ok(Self {
                 blob_client: Arc::new(blob_client),
-                runtime: Arc::new(runtime),
+                runtime,
                 blob_url_str: blob_url.to_string(),
             })
         }
