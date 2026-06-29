@@ -2,7 +2,9 @@
 mod azure_impl {
     use std::sync::{Arc, Mutex};
 
-    use azure_core::http::{NoFormat, RequestContent, XmlFormat};
+    use azure_core::http::{
+        new_http_client, HttpClient, NoFormat, RequestContent, Transport, XmlFormat,
+    };
     use azure_core::Bytes;
     use azure_storage_blob::models::{
         BlobClientDownloadOptions, BlockBlobClientStageBlockOptions, BlockLookupList,
@@ -16,14 +18,16 @@ mod azure_impl {
     use crate::error::{PyroError, Result};
 
     type SharedCredential = Arc<dyn azure_core::credentials::TokenCredential>;
+    type SharedHttpClient = Arc<dyn HttpClient>;
 
     const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
     const CREDENTIAL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-    /// Process-wide tokio runtime + Azure credential.
+    /// Process-wide tokio runtime, HTTP client, and Azure credential.
     struct SharedAzure {
         pid: u32,
         runtime: Arc<Runtime>,
+        http: SharedHttpClient,
         credential: Option<SharedCredential>,
     }
 
@@ -85,15 +89,15 @@ mod azure_impl {
             }
         }
 
-        // Developer tools
+        // 4. Developer tools (Azure CLI / azd).
         let cred: SharedCredential = azure_identity::DeveloperToolsCredential::new(None)
             .map_err(|e| PyroError::Backend(format!("credential error: {e}")))?;
         Ok(cred)
     }
 
-    /// Return the process-wide runtime and, when `need_credential` is set, the
-    /// shared credential.
-    fn shared_azure(need_credential: bool) -> Result<(Arc<Runtime>, Option<SharedCredential>)> {
+    fn shared_azure(
+        need_credential: bool,
+    ) -> Result<(Arc<Runtime>, SharedHttpClient, Option<SharedCredential>)> {
         let mut guard = SHARED_AZURE
             .lock()
             .map_err(|e| PyroError::Backend(format!("shared azure lock poisoned: {e}")))?;
@@ -108,6 +112,7 @@ mod azure_impl {
             *guard = Some(SharedAzure {
                 pid,
                 runtime: build_runtime()?,
+                http: new_http_client(),
                 credential: None,
             });
         }
@@ -117,7 +122,11 @@ mod azure_impl {
             shared.credential = Some(select_credential(&shared.runtime)?);
         }
 
-        Ok((Arc::clone(&shared.runtime), shared.credential.clone()))
+        Ok((
+            Arc::clone(&shared.runtime),
+            Arc::clone(&shared.http),
+            shared.credential.clone(),
+        ))
     }
 
     /// Azure Blob Storage backend.
@@ -136,15 +145,14 @@ mod azure_impl {
             // A SAS token (sig= in query) authenticates anonymously, so we don't
             // need (or want to build) a credential for it.
             let is_sas = parsed_url.query().map_or(false, |q| q.contains("sig="));
-            let (runtime, shared_credential) = shared_azure(!is_sas)?;
+            let (runtime, http, shared_credential) = shared_azure(!is_sas)?;
             let credential: Option<SharedCredential> = if is_sas { None } else { shared_credential };
 
-            let blob_client = BlobClient::from_url(
-                parsed_url.clone(),
-                credential,
-                Some(BlobClientOptions::default()),
-            )
-            .map_err(|e| PyroError::Backend(format!("client error: {e}")))?;
+            let mut options = BlobClientOptions::default();
+            options.client_options.transport = Some(Transport::new(http));
+
+            let blob_client = BlobClient::from_url(parsed_url.clone(), credential, Some(options))
+                .map_err(|e| PyroError::Backend(format!("client error: {e}")))?;
 
             Ok(Self {
                 blob_client: Arc::new(blob_client),
