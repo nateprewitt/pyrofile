@@ -123,6 +123,29 @@ impl PyPyroFile {
 
         // Clamp allocation to bytes remaining so read() never returns more than
         // the data available (negative size means read all remaining).
+        if size < 0 {
+            let (first, total, cursor) = py.allow_threads(|| {
+                let mut inner = self.lock_inner()?;
+                let first = inner.read_chunk()?;
+                let total = inner.get_size()?;
+                let cursor = inner.tell();
+                Ok::<(Vec<u8>, u64, u64), PyroError>((first, total, cursor))
+            })?;
+
+            if cursor >= total {
+                return Ok(PyBytes::new(py, &first));
+            }
+
+            let first_n = first.len();
+            let to_read = first_n + (total - cursor) as usize;
+            return PyBytes::new_with(py, to_read, |buf| {
+                buf[..first_n].copy_from_slice(&first);
+                let filled = py.allow_threads(|| self.lock_inner()?.read_into(&mut buf[first_n..]))?;
+                buf[first_n + filled..].fill(0);
+                Ok(())
+            });
+        }
+
         let (total_size, cursor) = py.allow_threads(|| {
             let mut inner = self.lock_inner()?;
             let total = inner.get_size()?;
@@ -135,11 +158,7 @@ impl PyPyroFile {
         }
 
         let remaining = (total_size - cursor) as usize;
-        let to_read = if size < 0 {
-            remaining
-        } else {
-            (size as usize).min(remaining)
-        };
+        let to_read = (size as usize).min(remaining);
 
         PyBytes::new_with(py, to_read, |buf| {
             let filled = py.allow_threads(|| self.lock_inner()?.read_into(buf))?;

@@ -51,6 +51,18 @@ impl StorageBackend for LocalBackend {
         Ok(n)
     }
 
+    fn read_chunk_sized(&self, offset: u64, max_len: usize) -> Result<(Vec<u8>, Option<u64>)> {
+        let size = self.metadata()?.content_length.unwrap_or(0);
+        if offset >= size {
+            return Ok((Vec::new(), Some(size)));
+        }
+        let want = ((size - offset) as usize).min(max_len);
+        let mut buf = vec![0u8; want];
+        let n = self.read_at(offset, &mut buf)?;
+        buf.truncate(n);
+        Ok((buf, Some(size)))
+    }
+
     fn metadata(&self) -> Result<ObjectMeta> {
         let meta = fs::metadata(&self.path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

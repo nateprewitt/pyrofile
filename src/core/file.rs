@@ -97,6 +97,33 @@ impl PyroIO {
         Ok(out)
     }
 
+    /// Read up to one parallel chunk at the cursor in a single request, advancing
+    /// the cursor past the bytes read. Cache total size for future chunk reads.
+    pub fn read_chunk(&mut self) -> Result<Vec<u8>> {
+        if self.mode != OpenMode::Read {
+            return Err(PyroError::NotSupported);
+        }
+        if self.closed {
+            return Err(PyroError::Closed);
+        }
+        // Size already known and the cursor is at EOF: nothing to read, and skip
+        // a request that would only come back empty (or a 416).
+        if matches!(self.size, Some(size) if self.cursor >= size) {
+            return Ok(Vec::new());
+        }
+
+        let chunk = self.cache.parallel_chunk_size().max(1);
+        let (data, total) = self.backend.read_chunk_sized(self.cursor, chunk)?;
+        self.cursor += data.len() as u64;
+        if let Some(total) = total {
+            self.size = Some(total);
+        } else if data.len() < chunk {
+            // A short read with no reported size means the object ends here.
+            self.size = Some(self.cursor);
+        }
+        Ok(data)
+    }
+
     /// Write data. Returns the number of bytes written (always == data.len()).
     pub fn write(&mut self, data: &[u8]) -> Result<usize> {
         if self.mode != OpenMode::Write {
@@ -267,6 +294,71 @@ mod tests {
         let backend = Arc::new(LocalBackend::new(&path));
         let mut f = PyroIO::new(backend, OpenMode::Read, PyroIOConfig::default());
         assert!(f.read(0).unwrap().is_empty());
+        assert_eq!(f.tell(), 0);
+    }
+
+    fn config_with_chunk(parallel_chunk_size: usize) -> PyroIOConfig {
+        PyroIOConfig {
+            read_config: crate::core::config::ReadConfig {
+                block_size: 16 * 1024 * 1024,
+                max_blocks: 4,
+                parallel_chunk_size,
+                max_read_concurrency: 32,
+            },
+            ..PyroIOConfig::default()
+        }
+    }
+
+    #[test]
+    fn read_chunk_small_object_returns_whole_and_caches_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        write_test_file(&path, b"abcdefghij");
+
+        let backend = Arc::new(LocalBackend::new(&path));
+        // Chunk larger than the object: a single request returns everything.
+        let mut f = PyroIO::new(backend, OpenMode::Read, config_with_chunk(64));
+
+        let chunk = f.read_chunk().unwrap();
+        assert_eq!(chunk, b"abcdefghij");
+        assert_eq!(f.tell(), 10);
+        // Size was learned from the read (no HEAD), and the cursor is at EOF, so a
+        // follow-up read_chunk returns empty without issuing another request.
+        assert_eq!(f.get_size().unwrap(), 10);
+        assert!(f.read_chunk().unwrap().is_empty());
+        assert_eq!(f.tell(), 10);
+    }
+
+    #[test]
+    fn read_chunk_large_object_reveals_size_for_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        write_test_file(&path, b"abcdefghij");
+
+        let backend = Arc::new(LocalBackend::new(&path));
+        // Chunk smaller than the object: the first read returns one chunk and the
+        // remainder is read from the advanced cursor knowing the full size.
+        let mut f = PyroIO::new(backend, OpenMode::Read, config_with_chunk(4));
+
+        let first = f.read_chunk().unwrap();
+        assert_eq!(first, b"abcd");
+        assert_eq!(f.tell(), 4);
+        assert_eq!(f.get_size().unwrap(), 10);
+
+        assert_eq!(f.read(-1).unwrap(), b"efghij");
+        assert_eq!(f.tell(), 10);
+    }
+
+    #[test]
+    fn read_chunk_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        write_test_file(&path, b"");
+
+        let backend = Arc::new(LocalBackend::new(&path));
+        let mut f = PyroIO::new(backend, OpenMode::Read, config_with_chunk(64));
+
+        assert!(f.read_chunk().unwrap().is_empty());
         assert_eq!(f.tell(), 0);
     }
 

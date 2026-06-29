@@ -126,6 +126,12 @@ impl BlockCache {
         Ok(filled)
     }
 
+    /// Size of a single concurrent read chunk. Used to size the first probe of a
+    /// read-to-EOF.
+    pub fn parallel_chunk_size(&self) -> usize {
+        self.parallel_chunk_size
+    }
+
     /// Look up or fetch the block starting at `block_start`.
     fn get_or_fetch(
         &mut self,

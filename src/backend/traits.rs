@@ -55,6 +55,20 @@ pub trait StorageBackend: Send + Sync {
         }
         Ok(filled)
     }
+
+    /// Read up to `max_len` bytes starting at `offset`, returning the bytes read
+    /// together with the object's total size when the backend can determine it
+    /// as part of the same request.
+    ///
+    /// The default implementation performs a plain [`read_at`](Self::read_at)
+    /// and reports no size (`None`), leaving callers to fall back to
+    /// [`metadata`](Self::metadata).
+    fn read_chunk_sized(&self, offset: u64, max_len: usize) -> Result<(Vec<u8>, Option<u64>)> {
+        let mut buf = vec![0u8; max_len];
+        let n = self.read_at(offset, &mut buf)?;
+        buf.truncate(n);
+        Ok((buf, None))
+    }
 }
 
 /// Write interface for storage backends.

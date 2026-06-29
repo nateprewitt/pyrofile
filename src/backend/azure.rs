@@ -180,11 +180,20 @@ mod azure_impl {
             options.range = Some(format!("bytes={}-{}", offset, offset + buf.len() as u64 - 1));
 
             self.block_on_safe(async {
-                let response = self
-                    .blob_client
-                    .download(Some(options))
-                    .await
-                    .map_err(|e| PyroError::Backend(format!("download error: {e}")))?;
+                let response = match self.blob_client.download(Some(options)).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // A ranged GET against an empty blob (or a range starting
+                        // past EOF) returns HTTP 416. Treat it as a clean
+                        // EOF (zero bytes) rather than surfacing an error.
+                        if e.http_status()
+                            == Some(azure_core::http::StatusCode::RequestedRangeNotSatisfiable)
+                        {
+                            return Ok(0usize);
+                        }
+                        return Err(PyroError::Backend(format!("download error: {e}")));
+                    }
+                };
 
                 let mut body = response.into_body();
                 let mut filled = 0usize;
@@ -205,12 +214,59 @@ mod azure_impl {
         }
     }
 
+    /// Parse the total object length out of a `Content-Range` header value.
+    /// Returns `None` when the total is unknown (`"*"`) or the header is malformed.
+    fn parse_content_range_total(range: &str) -> Option<u64> {
+        range.rsplit('/').next()?.trim().parse::<u64>().ok()
+    }
+
     impl StorageBackend for AzureBackend {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
             if buf.is_empty() {
                 return Ok(0);
             }
             self.download_into(offset, buf)
+        }
+
+        fn read_chunk_sized(&self, offset: u64, max_len: usize) -> Result<(Vec<u8>, Option<u64>)> {
+            use azure_storage_blob::models::BlobClientDownloadResultHeaders;
+
+            if max_len == 0 {
+                return Ok((Vec::new(), None));
+            }
+
+            let mut options = BlobClientDownloadOptions::default();
+            options.range = Some(format!("bytes={}-{}", offset, offset + max_len as u64 - 1));
+
+            self.block_on_safe(async {
+                let response = match self.blob_client.download(Some(options)).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if e.http_status()
+                            == Some(azure_core::http::StatusCode::RequestedRangeNotSatisfiable)
+                        {
+                            return Ok((Vec::new(), None));
+                        }
+                        return Err(PyroError::Backend(format!("download error: {e}")));
+                    }
+                };
+
+                // Harvest the total object size from `Content-Range` header before read
+                let total = response
+                    .content_range()
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .and_then(parse_content_range_total);
+
+                let data: Bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|e| PyroError::Backend(format!("read body error: {e}")))?;
+
+                Ok((data.to_vec(), total))
+            })
         }
 
         fn read_ranges(&self, ranges: &[(u64, usize)], dest: &mut [u8], max_concurrency: usize) -> Result<usize> {
