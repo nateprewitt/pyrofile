@@ -4,6 +4,25 @@
 
 - Nothing yet.
 
+## [0.3.1] - 2026-06-30
+
+### Performance
+
+- Reads no longer issue a HEAD request ahead of download. The object size is harvested
+  from the first ranged GET's `Content-Range` header.
+- Credentials and tokio runtime are now cached process-wide to prevent resolution
+  thrash when opening many small files.
+
+### Feature
+
+- Azure credential resolution now supports managed identity and environment
+  based credentials.
+
+### Changed
+
+- Credentials, HTTP clients, and tokio runtimes are now regenerated after process
+  forking to prevent concurrency issues.
+
 ## [0.3.0] - 2026-06-25
 
 ### Performance
