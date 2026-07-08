@@ -12,7 +12,7 @@ mod azure_impl {
     use azure_storage_blob::{BlobClient, BlobClientOptions, BlockBlobClient};
     use futures::StreamExt;
     use tokio::runtime::Runtime;
-    use tokio::task::JoinHandle;
+    use tokio::sync::Semaphore;
 
     use crate::backend::traits::{ObjectMeta, ObjectWriter, StorageBackend};
     use crate::error::{PyroError, Result};
@@ -348,12 +348,15 @@ mod azure_impl {
         fn create_writer(&self) -> Result<Box<dyn ObjectWriter>> {
             let block_blob_client = self.blob_client.block_blob_client();
             let config = crate::core::config::WriteConfig::default();
+            let max = config.max_concurrent_uploads;
             Ok(Box::new(AzureWriter {
                 block_blob_client: Arc::new(block_blob_client),
                 runtime: Arc::clone(&self.runtime),
                 buffer: Vec::new(),
                 block_ids: Vec::new(),
-                in_flight: Vec::new(),
+                sem: Arc::new(Semaphore::new(max)),
+                err: Arc::new(Mutex::new(None)),
+                max_concurrency: max as u32,
                 config,
                 closed: false,
             }))
@@ -370,31 +373,41 @@ mod azure_impl {
         runtime: Arc<Runtime>,
         buffer: Vec<u8>,
         block_ids: Vec<Vec<u8>>,
-        in_flight: Vec<JoinHandle<Result<()>>>,
+        /// Bounds in-flight uploads; a permit is held for the lifetime of each
+        /// spawned task, so dispatch resumes when *any* upload completes.
+        sem: Arc<Semaphore>,
+        /// First error observed by a background upload task, if any.
+        err: Arc<Mutex<Option<PyroError>>>,
+        max_concurrency: u32,
         config: crate::core::config::WriteConfig,
         closed: bool,
     }
 
     impl AzureWriter {
-        fn spawn_block_upload(&mut self, data: Vec<u8>) -> Result<()> {
-            // Apply backpressure: don't spawn if at concurrency cap.
-            if self.in_flight.len() >= self.config.max_concurrent_uploads {
-                self.drain_completed()?;
-            }
-            if self.in_flight.len() >= self.config.max_concurrent_uploads {
-                self.wait_for_one()?;
-            }
+        fn spawn_block_upload(&mut self, data: Bytes) -> Result<()> {
+            // Surface any earlier upload error before queueing more work.
+            self.check_error()?;
+
+            // Backpressure: block only until a permit is free (i.e. any
+            // in-flight upload has finished), not on a specific handle.
+            let permit = self
+                .runtime
+                .block_on(Arc::clone(&self.sem).acquire_owned())
+                .map_err(|e| PyroError::Backend(format!("semaphore error: {e}")))?;
 
             let block_id = uuid::Uuid::new_v4().to_string().into_bytes();
             self.block_ids.push(block_id.clone());
 
             let client = Arc::clone(&self.block_blob_client);
             let content_length = data.len() as u64;
+            let err_slot = Arc::clone(&self.err);
 
-            let handle = self.runtime.spawn(async move {
-                let body: RequestContent<Bytes, NoFormat> = Bytes::from(data).into();
+            self.runtime.spawn(async move {
+                // Held for the whole upload; released here, unblocking dispatch.
+                let _permit = permit;
+                let body: RequestContent<Bytes, NoFormat> = data.into();
 
-                client
+                let result = client
                     .stage_block(
                         &block_id,
                         content_length,
@@ -402,54 +415,39 @@ mod azure_impl {
                         None::<BlockBlobClientStageBlockOptions<'_>>,
                     )
                     .await
-                    .map_err(|e| PyroError::Backend(format!("stage_block error: {e}")))?;
+                    .map_err(|e| PyroError::Backend(format!("stage_block error: {e}")));
 
-                Ok(())
+                if let Err(e) = result {
+                    let mut slot = err_slot.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
             });
 
-            self.in_flight.push(handle);
             Ok(())
         }
 
-        fn drain_completed(&mut self) -> Result<()> {
-            let mut still_running = Vec::new();
-            for handle in self.in_flight.drain(..) {
-                if handle.is_finished() {
-                    self.runtime
-                        .block_on(handle)
-                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
-                } else {
-                    still_running.push(handle);
-                }
+        /// Take and return the first background error, if one occurred.
+        fn check_error(&self) -> Result<()> {
+            if let Some(e) = self.err.lock().unwrap().take() {
+                return Err(e);
             }
-            self.in_flight = still_running;
             Ok(())
         }
 
-        fn wait_for_one(&mut self) -> Result<()> {
-            if self.in_flight.is_empty() {
-                return Ok(());
-            }
-            let handle = self.in_flight.remove(0);
-            self.runtime
-                .block_on(handle)
-                .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
-            Ok(())
-        }
-
-        fn wait_for_in_flight(&mut self) -> Result<()> {
-            let handles: Vec<_> = self.in_flight.drain(..).collect();
-            if handles.is_empty() {
-                return Ok(());
-            }
-            self.runtime.block_on(async {
-                for handle in handles {
-                    handle.await
-                        .map_err(|e| PyroError::Backend(format!("task join error: {e}")))??;
-                }
-                Ok::<(), PyroError>(())
+        /// Wait for every in-flight upload to finish, then surface any error.
+        /// All permits are free exactly when no upload is running.
+        fn wait_for_all(&mut self) -> Result<()> {
+            let sem = Arc::clone(&self.sem);
+            let max = self.max_concurrency;
+            self.runtime.block_on(async move {
+                sem.acquire_many(max)
+                    .await
+                    .map_err(|e| PyroError::Backend(format!("semaphore error: {e}")))
+                    .map(|_permits| ())
             })?;
-            Ok(())
+            self.check_error()
         }
     }
 
@@ -470,15 +468,21 @@ mod azure_impl {
 
                 if self.buffer.len() >= self.config.part_size {
                     let block = std::mem::take(&mut self.buffer);
-                    self.spawn_block_upload(block)?;
+                    self.spawn_block_upload(Bytes::from(block))?;
                 }
             }
 
-            // Upload full blocks directly from input.
-            while remaining.len() >= self.config.part_size {
-                let block = remaining[..self.config.part_size].to_vec();
-                remaining = &remaining[self.config.part_size..];
-                self.spawn_block_upload(block)?;
+            // Copy the full-block span once, then hand out ref-counted slices
+            // per block instead of allocating a fresh Vec for each one.
+            let full = remaining.len() - (remaining.len() % self.config.part_size);
+            if full > 0 {
+                let mut blocks = Bytes::copy_from_slice(&remaining[..full]);
+                remaining = &remaining[full..];
+                while blocks.len() >= self.config.part_size {
+                    let block = blocks.slice(..self.config.part_size);
+                    blocks = blocks.slice(self.config.part_size..);
+                    self.spawn_block_upload(block)?;
+                }
             }
 
             // Buffer any sub-block-size tail.
@@ -490,7 +494,7 @@ mod azure_impl {
         }
 
         fn flush(&mut self) -> Result<()> {
-            self.drain_completed()
+            self.check_error()
         }
 
         fn close(&mut self) -> Result<()> {
@@ -500,10 +504,10 @@ mod azure_impl {
 
             if !self.buffer.is_empty() {
                 let data = std::mem::take(&mut self.buffer);
-                self.spawn_block_upload(data)?;
+                self.spawn_block_upload(Bytes::from(data))?;
             }
 
-            self.wait_for_in_flight()?;
+            self.wait_for_all()?;
 
             let block_list = BlockLookupList {
                 committed: None,
@@ -533,7 +537,6 @@ mod azure_impl {
 
         fn abort(&mut self) -> Result<()> {
             self.closed = true;
-            self.in_flight.clear();
             self.buffer.clear();
             self.block_ids.clear();
             Ok(())
