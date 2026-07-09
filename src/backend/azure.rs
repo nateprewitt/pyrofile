@@ -472,17 +472,13 @@ mod azure_impl {
                 }
             }
 
-            // Copy the full-block span once, then hand out ref-counted slices
-            // per block instead of allocating a fresh Vec for each one.
-            let full = remaining.len() - (remaining.len() % self.config.part_size);
-            if full > 0 {
-                let mut blocks = Bytes::copy_from_slice(&remaining[..full]);
-                remaining = &remaining[full..];
-                while blocks.len() >= self.config.part_size {
-                    let block = blocks.slice(..self.config.part_size);
-                    blocks = blocks.slice(self.config.part_size..);
-                    self.spawn_block_upload(block)?;
-                }
+            // Upload full blocks, copying each one out just before dispatch so
+            // the copy overlaps with in-flight uploads (avoid buffering the
+            // whole write up front).
+            while remaining.len() >= self.config.part_size {
+                let block = remaining[..self.config.part_size].to_vec();
+                remaining = &remaining[self.config.part_size..];
+                self.spawn_block_upload(Bytes::from(block))?;
             }
 
             // Buffer any sub-block-size tail.
