@@ -376,6 +376,48 @@ mod azure_impl {
     }
 
     impl AzureWriter {
+        fn copy_blocks_parallel(
+            data: &[u8],
+            block_size: usize,
+            max_workers: usize,
+        ) -> Vec<Vec<u8>> {
+            let block_count = data.len() / block_size;
+            let worker_count = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .min(max_workers)
+                .min(block_count);
+
+            if worker_count <= 1 {
+                return data
+                    .chunks_exact(block_size)
+                    .map(<[u8]>::to_vec)
+                    .collect();
+            }
+
+            let blocks_per_worker = block_count.div_ceil(worker_count);
+            let worker_bytes = blocks_per_worker * block_size;
+
+            std::thread::scope(|scope| {
+                let copies: Vec<_> = data
+                    .chunks(worker_bytes)
+                    .map(|blocks| {
+                        scope.spawn(move || {
+                            blocks
+                                .chunks_exact(block_size)
+                                .map(<[u8]>::to_vec)
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+
+                copies
+                    .into_iter()
+                    .flat_map(|copy| copy.join().expect("block copy worker panicked"))
+                    .collect()
+            })
+        }
+
         fn spawn_block_upload(&mut self, data: Vec<u8>) -> Result<()> {
             // Apply backpressure: don't spawn if at concurrency cap.
             if self.in_flight.len() >= self.config.max_concurrent_uploads {
@@ -474,12 +516,26 @@ mod azure_impl {
                 }
             }
 
-            // Upload full blocks directly from input.
-            while remaining.len() >= self.config.part_size {
-                let block = remaining[..self.config.part_size].to_vec();
-                remaining = &remaining[self.config.part_size..];
-                self.spawn_block_upload(block)?;
+            // Copy full blocks in parallel, one upload window at a time.
+            let full_block_bytes =
+                remaining.len() / self.config.part_size * self.config.part_size;
+            let (full_blocks, tail) = remaining.split_at(full_block_bytes);
+            let copy_window = self
+                .config
+                .part_size
+                .checked_mul(self.config.max_concurrent_uploads.max(1))
+                .unwrap_or(full_blocks.len().max(self.config.part_size));
+
+            for window in full_blocks.chunks(copy_window) {
+                for block in Self::copy_blocks_parallel(
+                    window,
+                    self.config.part_size,
+                    self.config.max_concurrent_uploads.max(1),
+                ) {
+                    self.spawn_block_upload(block)?;
+                }
             }
+            remaining = tail;
 
             // Buffer any sub-block-size tail.
             if !remaining.is_empty() {
@@ -545,6 +601,29 @@ mod azure_impl {
             if !self.closed {
                 let _ = self.abort();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::AzureWriter;
+
+        #[test]
+        fn parallel_block_copy_preserves_order() {
+            let data: Vec<u8> = (0..48).collect();
+            let blocks = AzureWriter::copy_blocks_parallel(&data, 16, 2);
+
+            assert_eq!(blocks.len(), 3);
+            assert_eq!(blocks.concat(), data);
+        }
+
+        #[test]
+        fn parallel_block_copy_ignores_partial_tail() {
+            let data: Vec<u8> = (0..40).collect();
+            let blocks = AzureWriter::copy_blocks_parallel(&data, 16, 2);
+
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks.concat(), data[..32]);
         }
     }
 }
