@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "pyrofile"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "azure_core",
  "azure_identity",

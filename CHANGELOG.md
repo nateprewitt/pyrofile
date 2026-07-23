@@ -4,6 +4,13 @@
 
 - Nothing yet.
 
+## [0.3.2] - 2026-07-23
+
+### Performance
+
+- Azure upload blocks are now copied in parallel. This should improve write
+  throughput at the cost of additional memory usage (block size x concurrency).
+
 ## [0.3.1] - 2026-06-30
 
 ### Performance
