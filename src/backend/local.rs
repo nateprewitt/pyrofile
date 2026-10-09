@@ -1,10 +1,19 @@
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::backend::traits::{ObjectMeta, ObjectWriter, StorageBackend};
 use crate::error::{PyroError, Result};
+
+#[cfg(unix)]
+fn read_file_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
 
 /// Local filesystem backend.
 pub struct LocalBackend {
@@ -47,7 +56,7 @@ impl StorageBackend for LocalBackend {
             return Ok(0);
         }
         let file = self.get_read_handle()?;
-        let n = file.read_at(buf, offset)?;
+        let n = read_file_at(file, buf, offset)?;
         Ok(n)
     }
 
