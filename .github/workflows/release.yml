@@ -23,7 +23,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           command: build
-          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 -o dist
+          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 3.14 -o dist
           manylinux: auto
           before-script-linux: |
             case "${{ matrix.target }}" in
@@ -53,10 +53,26 @@ jobs:
         with:
           target: ${{ matrix.target }}
           command: build
-          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 -o dist
+          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 3.14 -o dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-macos-${{ matrix.target }}
+          path: dist/
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: x64
+          command: build
+          args: --release --features azure --interpreter 3.10 3.11 3.12 3.13 3.14 -o dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-windows-x64
           path: dist/
 
   sdist:
@@ -75,7 +91,7 @@ jobs:
           path: dist/
 
   publish:
-    needs: [build-linux, build-macos, sdist]
+    needs: [build-linux, build-macos, build-windows, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
