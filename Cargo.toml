@@ -11,7 +11,7 @@ name = "_pyrofile"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
 futures = { version = "0.3", optional = true }
